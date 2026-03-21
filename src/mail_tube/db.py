@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS inbox_items (
     first_inboxed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     watched_at TEXT,
+    starred_at TEXT,
+    dismissed_at TEXT,
     opened_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE(profile_id, video_id)
 );
@@ -141,10 +143,50 @@ class Database:
                 ADD COLUMN is_starred INTEGER NOT NULL DEFAULT 0 CHECK(is_starred IN (0, 1))
                 """
             )
+        if "starred_at" not in columns:
+            conn.execute(
+                """
+                ALTER TABLE inbox_items
+                ADD COLUMN starred_at TEXT
+                """
+            )
+        if "dismissed_at" not in columns:
+            conn.execute(
+                """
+                ALTER TABLE inbox_items
+                ADD COLUMN dismissed_at TEXT
+                """
+            )
+        conn.execute(
+            """
+            UPDATE inbox_items
+            SET starred_at = COALESCE(starred_at, last_seen_at, first_inboxed_at, CURRENT_TIMESTAMP)
+            WHERE is_starred = 1 AND starred_at IS NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE inbox_items
+            SET dismissed_at = COALESCE(dismissed_at, watched_at, last_seen_at, first_inboxed_at, CURRENT_TIMESTAMP)
+            WHERE status = 'dismissed' AND dismissed_at IS NULL
+            """
+        )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_inbox_profile_starred
             ON inbox_items(profile_id, is_starred)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_inbox_profile_starred_at
+            ON inbox_items(profile_id, is_starred, starred_at DESC, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_inbox_profile_dismissed_at
+            ON inbox_items(profile_id, status, dismissed_at DESC, id DESC)
             """
         )
 
@@ -445,11 +487,23 @@ class Database:
         offset: int,
         statuses: tuple[str, ...] = ("new", "watched"),
         starred_only: bool = False,
+        sort_by_watched_at: bool = False,
+        sort_mode: str = "published",
     ) -> list[sqlite3.Row]:
         if not statuses:
             return []
         placeholders = ", ".join("?" for _ in statuses)
         starred_clause = " AND inbox_items.is_starred = 1" if starred_only else ""
+        resolved_sort_mode = (sort_mode or "published").strip().lower()
+        if sort_by_watched_at and resolved_sort_mode == "published":
+            resolved_sort_mode = "watched"
+        order_map = {
+            "published": "videos.published_at DESC, inbox_items.id DESC",
+            "watched": "inbox_items.watched_at DESC, inbox_items.id DESC",
+            "starred": "inbox_items.starred_at DESC, inbox_items.id DESC",
+            "dismissed": "inbox_items.dismissed_at DESC, inbox_items.id DESC",
+        }
+        order_clause = order_map.get(resolved_sort_mode, order_map["published"])
         with self.connect() as conn:
             return list(
                 conn.execute(
@@ -460,6 +514,8 @@ class Database:
                         inbox_items.status,
                         inbox_items.is_starred,
                         inbox_items.watched_at,
+                        inbox_items.starred_at,
+                        inbox_items.dismissed_at,
                         inbox_items.opened_count,
                         inbox_items.first_inboxed_at,
                         videos.youtube_video_id,
@@ -471,7 +527,7 @@ class Database:
                     WHERE inbox_items.profile_id = ?
                       AND inbox_items.status IN ({placeholders})
                       {starred_clause}
-                    ORDER BY videos.published_at DESC, inbox_items.id DESC
+                    ORDER BY {order_clause}
                     LIMIT ? OFFSET ?
                     """,
                     (profile_id, *statuses, limit, offset),
@@ -485,7 +541,8 @@ class Database:
                     """
                     UPDATE inbox_items
                     SET status = 'watched',
-                        watched_at = COALESCE(watched_at, CURRENT_TIMESTAMP)
+                        watched_at = COALESCE(watched_at, CURRENT_TIMESTAMP),
+                        dismissed_at = NULL
                     WHERE id = ?
                     """,
                     (inbox_item_id,),
@@ -495,7 +552,8 @@ class Database:
                     """
                     UPDATE inbox_items
                     SET status = 'new',
-                        watched_at = NULL
+                        watched_at = NULL,
+                        dismissed_at = NULL
                     WHERE id = ?
                     """,
                     (inbox_item_id,),
@@ -509,6 +567,8 @@ class Database:
                 UPDATE inbox_items
                 SET status = 'dismissed'
                     , is_starred = 0
+                    , starred_at = NULL
+                    , dismissed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (inbox_item_id,),
@@ -517,28 +577,51 @@ class Database:
 
     def mark_inbox_starred(self, inbox_item_id: int, *, starred: bool) -> None:
         with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE inbox_items
-                SET is_starred = ?
-                WHERE id = ?
-                """,
-                (1 if starred else 0, inbox_item_id),
-            )
+            if starred:
+                conn.execute(
+                    """
+                    UPDATE inbox_items
+                    SET is_starred = 1,
+                        starred_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (inbox_item_id,),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE inbox_items
+                    SET is_starred = 0,
+                        starred_at = NULL
+                    WHERE id = ?
+                    """,
+                    (inbox_item_id,),
+                )
             conn.commit()
 
-    def mark_inbox_opened(self, inbox_item_id: int) -> None:
+    def mark_inbox_opened(self, inbox_item_id: int, *, mark_watched: bool = True) -> None:
         with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE inbox_items
-                SET opened_count = opened_count + 1,
-                    status = 'watched',
-                    watched_at = COALESCE(watched_at, CURRENT_TIMESTAMP)
-                WHERE id = ?
-                """,
-                (inbox_item_id,),
-            )
+            if mark_watched:
+                conn.execute(
+                    """
+                    UPDATE inbox_items
+                    SET opened_count = opened_count + 1,
+                        status = 'watched',
+                        watched_at = COALESCE(watched_at, CURRENT_TIMESTAMP),
+                        dismissed_at = NULL
+                    WHERE id = ?
+                    """,
+                    (inbox_item_id,),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE inbox_items
+                    SET opened_count = opened_count + 1
+                    WHERE id = ?
+                    """,
+                    (inbox_item_id,),
+                )
             conn.commit()
 
     def get_inbox_item_with_video(self, inbox_item_id: int) -> sqlite3.Row | None:

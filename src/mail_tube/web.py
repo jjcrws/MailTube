@@ -14,7 +14,7 @@ from .refresh import refresh_all_profiles, refresh_profile
 from .youtube import build_embed_url
 
 RESOURCES_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "resources"))
-ALLOWED_RESOURCE_FILES = {"Email-logo.png", "Youtube-logo.png", "MailTube-logo_v0.png"}
+ALLOWED_RESOURCE_FILES = {"Email-logo.png", "Youtube-logo.png", "MailTube-logo_v0.png", "htmx.min.js"}
 
 
 def _to_int(value: str | None, *, default: int) -> int:
@@ -33,6 +33,29 @@ def _safe_return_to(value: str | None, *, default: str = "/inbox") -> str:
     if not candidate.startswith("/") or candidate.startswith("//"):
         return default
     return candidate
+
+
+def _append_query_flag(url: str, key: str, value: str) -> str:
+    joiner = "&" if "?" in url else "?"
+    return f"{url}{joiner}{urlencode({key: value})}"
+
+
+def _drop_open_from_return_to_if_matches(value: str | None, *, inbox_item_id: int) -> str | None:
+    if not value:
+        return value
+    parsed = urlparse(value)
+    if parsed.path != "/inbox":
+        return value
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    open_id = _to_int((query.get("open") or [None])[0], default=-1)
+    if open_id != inbox_item_id:
+        return value
+    query.pop("open", None)
+    encoded = urlencode([(k, v) for k, vals in query.items() for v in vals])
+    rebuilt = parsed.path if not encoded else f"{parsed.path}?{encoded}"
+    if parsed.fragment:
+        rebuilt = f"{rebuilt}#{parsed.fragment}"
+    return rebuilt
 
 
 def _relative_published_label(value: str | None) -> str:
@@ -384,6 +407,59 @@ def _base_layout(title: str, body: str) -> str:
       flex-wrap: wrap;
       justify-content: flex-end;
     }}
+    .item-picker {{
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      border: 1px solid #2b3a52;
+      background: #0d1626;
+      cursor: pointer;
+    }}
+    .item-picker input {{
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      accent-color: #1ec4ff;
+      cursor: pointer;
+    }}
+    .workspace.select-mode .item-picker {{
+      display: inline-flex;
+    }}
+    .workspace.select-mode .item-action-form {{
+      display: none;
+    }}
+    .selection-toggle {{
+      min-width: 98px;
+    }}
+    .bulk-toolbar {{
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      border: 1px dashed #3f526f;
+      border-radius: var(--radius-tight);
+      padding: 9px 10px;
+      background: rgba(30, 196, 255, 0.06);
+    }}
+    .workspace.select-mode .bulk-toolbar {{
+      display: flex;
+    }}
+    .bulk-count {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.78rem;
+      white-space: nowrap;
+    }}
+    .bulk-actions {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      margin-left: auto;
+    }}
     .watch-dock {{
       padding: 12px;
       position: sticky;
@@ -416,7 +492,8 @@ def _base_layout(title: str, body: str) -> str:
       background: rgba(255, 255, 255, 0.015);
       min-height: 220px;
       display: grid;
-      align-content: center;
+      place-items: center;
+      text-align: center;
     }}
     .watch-item-title {{
       margin: 0 0 8px;
@@ -622,6 +699,10 @@ def _base_layout(title: str, body: str) -> str:
     .mobile-close {{
       display: none;
     }}
+    form.is-pending {{
+      opacity: 0.62;
+      pointer-events: none;
+    }}
     @media (max-width: 1180px) {{
       .workspace {{
         grid-template-columns: 190px minmax(420px, 1fr) minmax(280px, 390px);
@@ -666,6 +747,196 @@ def _base_layout(title: str, body: str) -> str:
   <main class="app-frame">
     {body}
   </main>
+  <script src="/resources/htmx.min.js"></script>
+  <script>
+    (() => {{
+      const workspaceSelector = "#inbox-workspace";
+      let pendingWorkspaceTopReset = false;
+
+      function getWorkspace() {{
+        return document.querySelector(workspaceSelector);
+      }}
+
+      function resetWindowScrollTop() {{
+        window.scrollTo(0, 0);
+        document.documentElement.scrollTop = 0;
+        document.body.scrollTop = 0;
+      }}
+
+      function requestWorkspaceTopReset() {{
+        pendingWorkspaceTopReset = true;
+      }}
+
+      function selectedInputs(workspace) {{
+        return Array.from(workspace.querySelectorAll(".item-select:checked"));
+      }}
+
+      function selectedIds(workspace) {{
+        return selectedInputs(workspace).map((input) => input.value);
+      }}
+
+      function updateSelectionUi(workspace) {{
+        const ids = selectedIds(workspace);
+        const countEl = workspace.querySelector("[data-bulk-count]");
+        if (countEl) {{
+          countEl.textContent = `${{ids.length}} selected`;
+        }}
+        workspace.querySelectorAll("[data-bulk-submit]").forEach((button) => {{
+          if (button instanceof HTMLButtonElement) {{
+            button.disabled = ids.length === 0;
+          }}
+        }});
+        const itemIdsField = workspace.querySelector('input[name="item_ids"]');
+        if (itemIdsField instanceof HTMLInputElement) {{
+          itemIdsField.value = ids.join(",");
+        }}
+        const returnToField = workspace.querySelector('[data-bulk-form] input[name="return_to"]');
+        const returnTo = workspace.dataset.returnTo;
+        if (returnToField instanceof HTMLInputElement && typeof returnTo === "string" && returnTo.startsWith("/")) {{
+          returnToField.value = returnTo;
+        }}
+      }}
+
+      function setSelectMode(workspace, enabled) {{
+        workspace.classList.toggle("select-mode", enabled);
+        const toggle = workspace.querySelector("[data-select-toggle]");
+        if (toggle instanceof HTMLButtonElement) {{
+          toggle.textContent = enabled ? "Exit Select" : "Select Mode";
+          toggle.setAttribute("aria-pressed", enabled ? "true" : "false");
+        }}
+        if (!enabled) {{
+          workspace.querySelectorAll(".item-select:checked").forEach((input) => {{
+            if (input instanceof HTMLInputElement) {{
+              input.checked = false;
+            }}
+          }});
+        }}
+        updateSelectionUi(workspace);
+      }}
+
+      document.addEventListener(
+        "submit",
+        (event) => {{
+          const target = event.target;
+          if (!(target instanceof HTMLFormElement)) {{
+            return;
+          }}
+          if (target.getAttribute("action") === "/inbox/refresh") {{
+            requestWorkspaceTopReset();
+          }}
+          if (!target.matches("[data-bulk-form]")) {{
+            return;
+          }}
+          const workspace = getWorkspace();
+          if (!workspace) {{
+            return;
+          }}
+          updateSelectionUi(workspace);
+          const selected = selectedIds(workspace);
+          if (selected.length === 0) {{
+            event.preventDefault();
+          }}
+        }},
+        true,
+      );
+
+      document.addEventListener(
+        "click",
+        (event) => {{
+          const target = event.target;
+          if (!(target instanceof Element)) {{
+            return;
+          }}
+          const workspace = getWorkspace();
+          if (!workspace) {{
+            return;
+          }}
+
+          const toggle = target.closest("[data-select-toggle]");
+          if (toggle) {{
+            event.preventDefault();
+            setSelectMode(workspace, !workspace.classList.contains("select-mode"));
+            return;
+          }}
+
+          const cancel = target.closest("[data-bulk-cancel]");
+          if (cancel) {{
+            event.preventDefault();
+            setSelectMode(workspace, false);
+            return;
+          }}
+
+          const listNavLink = target.closest(".rail-link, #pagination a");
+          if (listNavLink instanceof HTMLAnchorElement) {{
+            requestWorkspaceTopReset();
+          }}
+
+          const rowLink = target.closest(".message-main a");
+          if (rowLink instanceof HTMLAnchorElement) {{
+            if (workspace.classList.contains("select-mode")) {{
+              event.preventDefault();
+              const row = rowLink.closest(".message-row");
+              const checkbox = row?.querySelector(".item-select");
+              if (checkbox instanceof HTMLInputElement) {{
+                checkbox.checked = !checkbox.checked;
+                updateSelectionUi(workspace);
+              }}
+              return;
+            }}
+
+            updateSelectionUi(workspace);
+          }}
+        }},
+        true,
+      );
+
+      document.body.addEventListener("htmx:afterSwap", (event) => {{
+        const workspace = getWorkspace();
+        if (!workspace) {{
+          return;
+        }}
+        const swapTarget = event.target;
+        if (!(swapTarget instanceof Element)) {{
+          return;
+        }}
+        if (swapTarget !== workspace && !workspace.contains(swapTarget)) {{
+          return;
+        }}
+        updateSelectionUi(workspace);
+      }});
+
+      document.body.addEventListener("htmx:afterSettle", () => {{
+        if (!pendingWorkspaceTopReset) {{
+          return;
+        }}
+        pendingWorkspaceTopReset = false;
+        requestAnimationFrame(() => {{
+          resetWindowScrollTop();
+        }});
+      }});
+
+      document.addEventListener(
+        "change",
+        (event) => {{
+          const target = event.target;
+          if (!(target instanceof HTMLInputElement) || !target.classList.contains("item-select")) {{
+            return;
+          }}
+          const workspace = getWorkspace();
+          if (!workspace) {{
+            return;
+          }}
+          updateSelectionUi(workspace);
+        }},
+        true,
+      );
+
+      const initialWorkspace = getWorkspace();
+      if (initialWorkspace) {{
+        updateSelectionUi(initialWorkspace);
+      }}
+    }})();
+  </script>
 </body>
 </html>"""
 
@@ -725,6 +996,12 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         if path.startswith("/inbox/item/") and path.endswith("/unstar"):
             self._post_mark_star(path, form, starred=False)
             return
+        if path.startswith("/inbox/item/") and path.endswith("/close"):
+            self._post_close_viewer(path, form)
+            return
+        if path == "/inbox/bulk":
+            self._post_bulk_action(form)
+            return
         if path == "/filters/add":
             self._post_add_filter(form)
             return
@@ -746,10 +1023,13 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(body, keep_blank_values=True)
         return {key: values[0] for key, values in parsed.items()}
 
-    def _send_html(self, body: str, *, status: int = 200) -> None:
+    def _send_html(self, body: str, *, status: int = 200, headers: dict[str, str] | None = None) -> None:
         payload = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        if headers:
+            for name, value in headers.items():
+                self.send_header(name, value)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -780,6 +1060,40 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         self.send_response(303)
         self.send_header("Location", location)
         self.end_headers()
+
+    def _is_htmx_request(self) -> bool:
+        return self.headers.get("HX-Request", "").strip().lower() == "true"
+
+    def _htmx_current_open_id(self) -> int | None:
+        current_url = self.headers.get("HX-Current-URL")
+        if not current_url:
+            return None
+        parsed = urlparse(current_url)
+        if parsed.path != "/inbox":
+            return None
+        open_id = _to_int((parse_qs(parsed.query).get("open") or [None])[0], default=-1)
+        return open_id if open_id > 0 else None
+
+    def _respond_inbox_action(
+        self,
+        form: dict[str, str],
+        *,
+        default: str = "/inbox",
+        item_id: int | None = None,
+    ) -> None:
+        target = _safe_return_to(form.get("return_to"), default=default)
+        parsed = urlparse(target)
+        if self._is_htmx_request() and parsed.path == "/inbox":
+            swap_mode = (form.get("swap_mode") or "workspace").strip().lower()
+            fragment_mode = swap_mode if swap_mode in {"row", "list"} else None
+            self._render_inbox(
+                parse_qs(parsed.query),
+                response_headers={"HX-Push-Url": target},
+                fragment_mode=fragment_mode,
+                fragment_item_id=item_id,
+            )
+            return
+        self._redirect(target)
 
     def _selected_profile(self, requested: int | None) -> sqlite3.Row | None:
         if requested is not None:
@@ -816,7 +1130,14 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         )
         self._send_html(body)
 
-    def _render_inbox(self, query: dict[str, list[str]]) -> None:
+    def _render_inbox(
+        self,
+        query: dict[str, list[str]],
+        *,
+        response_headers: dict[str, str] | None = None,
+        fragment_mode: str | None = None,
+        fragment_item_id: int | None = None,
+    ) -> None:
         profiles = self.db.list_profiles()
         if not profiles:
             self._render_no_profiles(section="inbox")
@@ -832,6 +1153,11 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         active_list = (query.get("list") or ["inbox"])[0]
         if active_list not in {"inbox", "watched", "trash", "starred"}:
             active_list = "inbox"
+        requested_fragment = fragment_mode
+        if requested_fragment is None:
+            candidate_fragment = (query.get("fragment") or [None])[0]
+            if candidate_fragment in {"row", "list", "viewer"}:
+                requested_fragment = candidate_fragment
 
         starred_only = False
         if active_list == "watched":
@@ -847,10 +1173,11 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         page = max(1, _to_int((query.get("page") or [None])[0], default=1))
         selected_open_id = _to_int((query.get("open") or [None])[0], default=-1)
         selected_item: sqlite3.Row | None = None
+        previous_open_id = self._htmx_current_open_id() if requested_fragment == "viewer" else None
         if selected_open_id > 0:
             candidate = self.db.get_inbox_item_with_video(selected_open_id)
             if candidate and int(candidate["profile_id"]) == profile_id:
-                self.db.mark_inbox_opened(selected_open_id)
+                self.db.mark_inbox_opened(selected_open_id, mark_watched=False)
                 selected_item = self.db.get_inbox_item_with_video(selected_open_id)
             else:
                 selected_open_id = -1
@@ -863,9 +1190,19 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             offset=offset,
             statuses=statuses,
             starred_only=starred_only,
+            sort_mode=(
+                "watched"
+                if active_list == "watched"
+                else "starred"
+                if active_list == "starred"
+                else "dismissed"
+                if active_list == "trash"
+                else "published"
+            ),
         )
         latest_run = self.db.latest_refresh_run(profile_id)
         return_to = _inbox_location(profile_id, active_list, page=page, open_item_id=selected_open_id)
+        safe_return_to = html.escape(return_to, quote=True)
         profile_switch_return = f"/inbox?{urlencode({'list': active_list, 'page': page})}"
         list_labels = {
             "inbox": "Inbox",
@@ -875,6 +1212,8 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         }
 
         rows: list[str] = []
+        rows_by_id: dict[int, str] = {}
+        list_swap_attrs = 'hx-select="unset" hx-target="#message-list" hx-swap="outerHTML show:none"'
         for item in items:
             inbox_item_id = int(item["inbox_item_id"])
             title = _safe_display_text(item["title"])
@@ -883,6 +1222,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             status = str(item["status"])
             is_starred = bool(item["is_starred"])
             open_link = _inbox_location(profile_id, active_list, page=page, open_item_id=inbox_item_id)
+            open_request_link = _append_query_flag(open_link, "fragment", "viewer")
             item_return = _inbox_location(
                 profile_id,
                 active_list,
@@ -893,8 +1233,9 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             if status == "new":
                 actions.append(
                     f"""
-                    <form method="post" action="/inbox/item/{inbox_item_id}/watch">
+                    <form class="item-action-form" method="post" action="/inbox/item/{inbox_item_id}/watch" {list_swap_attrs}>
                       <input type="hidden" name="return_to" value="{item_return}">
+                      <input type="hidden" name="swap_mode" value="list">
                       <button class="icon-button" type="submit" title="Move to watched" aria-label="Move to watched">{EYE_ICON_SVG}</button>
                     </form>
                     """
@@ -903,8 +1244,9 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                 restore_label = "Move to inbox" if status == "watched" else "Restore to inbox"
                 actions.append(
                     f"""
-                    <form method="post" action="/inbox/item/{inbox_item_id}/unwatch">
+                    <form class="item-action-form" method="post" action="/inbox/item/{inbox_item_id}/unwatch" {list_swap_attrs}>
                       <input type="hidden" name="return_to" value="{item_return}">
+                      <input type="hidden" name="swap_mode" value="list">
                       <button class="icon-button" type="submit" title="{restore_label}" aria-label="{restore_label}">↺</button>
                     </form>
                     """
@@ -915,10 +1257,17 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                 star_title = "Remove star" if is_starred else "Save item"
                 star_icon = STAR_FILLED_ICON_SVG if is_starred else STAR_ICON_SVG
                 starred_class = " starred" if is_starred else ""
+                star_swap_mode = "row" if active_list in {"inbox", "watched"} else "list"
+                star_swap_attrs = (
+                    'hx-select="unset" hx-target="closest .message-row" hx-swap="outerHTML show:none"'
+                    if star_swap_mode == "row"
+                    else list_swap_attrs
+                )
                 actions.append(
                     f"""
-                    <form method="post" action="/inbox/item/{inbox_item_id}/{star_action}">
+                    <form class="item-action-form" method="post" action="/inbox/item/{inbox_item_id}/{star_action}" {star_swap_attrs}>
                       <input type="hidden" name="return_to" value="{item_return}">
+                      <input type="hidden" name="swap_mode" value="{star_swap_mode}">
                       <button class="icon-button{starred_class}" type="submit" title="{star_title}" aria-label="{star_title}">{star_icon}</button>
                     </form>
                     """
@@ -927,28 +1276,34 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             if status != "dismissed":
                 actions.append(
                     f"""
-                    <form method="post" action="/inbox/item/{inbox_item_id}/trash">
+                    <form class="item-action-form" method="post" action="/inbox/item/{inbox_item_id}/trash" {list_swap_attrs}>
                       <input type="hidden" name="return_to" value="{item_return}">
+                      <input type="hidden" name="swap_mode" value="list">
                       <button class="icon-button" type="submit" title="Move to trash" aria-label="Move to trash">{TRASH_ICON_SVG}</button>
                     </form>
                     """
                 )
             active_class = " active" if inbox_item_id == selected_open_id else ""
-            rows.append(
+            row_markup = (
                 f"""
-                <article class="message-row{active_class}">
+                <article id="inbox-item-{inbox_item_id}" class="message-row{active_class}">
                   <div class="message-main">
-                    <a href="{open_link}">{title}</a>
+                    <a href="{open_link}" hx-get="{open_request_link}" hx-push-url="{open_link}" hx-select="unset" hx-target="#watch-dock" hx-swap="outerHTML show:none">{title}</a>
                     <div class="message-meta">
                       <span>{channel} | {html.escape(published)}</span>
                     </div>
                   </div>
                   <div class="message-actions">
+                    <label class="item-picker" title="Select item">
+                      <input class="item-select" type="checkbox" value="{inbox_item_id}" aria-label="Select item {inbox_item_id}">
+                    </label>
                     {''.join(actions)}
                   </div>
                 </article>
                 """
             )
+            rows.append(row_markup)
+            rows_by_id[inbox_item_id] = row_markup
 
         if not rows:
             empty_labels = {
@@ -961,8 +1316,14 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             rows.append(
                 f"""
                 <div class="empty-state">{empty_text}</div>
-                """
-            )
+                    """
+                )
+
+        message_list_html = f"""
+                <div id="message-list" class="message-list">
+                  {''.join(rows)}
+                </div>
+        """
 
         prev_link = ""
         if page > 1:
@@ -978,7 +1339,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
 
         selected_dock = """
             <div class="watch-dock-empty">
-              Select an item from the stream to open the watch dock. On mobile, the dock becomes a full-screen sheet.
+              Select an item to start the player.
             </div>
         """
         dock_class = ""
@@ -988,22 +1349,15 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             selected_status = str(selected_item["status"])
             embed_url = html.escape(build_embed_url(selected_item["youtube_video_id"], autoplay=True), quote=True)
             close_link = _inbox_location(profile_id, active_list, page=page)
+            close_action = f"/inbox/item/{selected_open_id}/close"
             dock_actions: list[str] = []
 
-            if selected_status == "new":
+            if selected_status != "new":
                 dock_actions.append(
                     f"""
-                    <form method="post" action="/inbox/item/{selected_open_id}/watch">
+                    <form method="post" action="/inbox/item/{selected_open_id}/unwatch" {list_swap_attrs}>
                       <input type="hidden" name="return_to" value="{return_to}">
-                      <button type="submit">Mark watched</button>
-                    </form>
-                    """
-                )
-            else:
-                dock_actions.append(
-                    f"""
-                    <form method="post" action="/inbox/item/{selected_open_id}/unwatch">
-                      <input type="hidden" name="return_to" value="{return_to}">
+                      <input type="hidden" name="swap_mode" value="list">
                       <button type="submit">Move to inbox</button>
                     </form>
                     """
@@ -1017,8 +1371,9 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                 star_class = " starred" if selected_is_starred else ""
                 dock_actions.append(
                     f"""
-                    <form method="post" action="/inbox/item/{selected_open_id}/{star_action}">
+                    <form method="post" action="/inbox/item/{selected_open_id}/{star_action}" {list_swap_attrs}>
                       <input type="hidden" name="return_to" value="{return_to}">
+                      <input type="hidden" name="swap_mode" value="list">
                       <button class="icon-button{star_class}" type="submit" title="{star_title}" aria-label="{star_title}">{star_icon}</button>
                     </form>
                     """
@@ -1027,8 +1382,9 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             if selected_status != "dismissed":
                 dock_actions.append(
                     f"""
-                    <form method="post" action="/inbox/item/{selected_open_id}/trash">
+                    <form method="post" action="/inbox/item/{selected_open_id}/trash" {list_swap_attrs}>
                       <input type="hidden" name="return_to" value="{return_to}">
+                      <input type="hidden" name="swap_mode" value="list">
                       <button class="icon-button" type="submit" title="Move to trash" aria-label="Move to trash">{TRASH_ICON_SVG}</button>
                     </form>
                     """
@@ -1037,28 +1393,102 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             selected_dock = f"""
                 <div class="watch-dock-head">
                   <h3 class="watch-title">Watch Dock</h3>
-                  <a class="icon-link-button mobile-close" href="{close_link}" title="Close watch dock" aria-label="Close watch dock">{BACK_ICON_SVG}</a>
+                  <form method="post" action="{close_action}" {list_swap_attrs}>
+                    <input type="hidden" name="return_to" value="{close_link}">
+                    <input type="hidden" name="swap_mode" value="list">
+                    <button class="icon-link-button mobile-close" type="submit" title="Close watch dock" aria-label="Close watch dock">{BACK_ICON_SVG}</button>
+                  </form>
                 </div>
                 <p class="watch-item-title">{selected_title}</p>
                 <p class="watch-meta">{selected_channel} · {html.escape(selected_status)}</p>
                 <iframe
                   src="{embed_url}"
+                  sandbox="allow-scripts allow-same-origin allow-presentation allow-forms"
                   allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                   referrerpolicy="strict-origin-when-cross-origin"
                   allowfullscreen
                   title="YouTube video player"></iframe>
                 <div class="watch-actions">
-                  <a class="drawer-link" href="{close_link}" title="Close watch dock" aria-label="Close watch dock">Close</a>
+                  <form method="post" action="{close_action}" {list_swap_attrs}>
+                    <input type="hidden" name="return_to" value="{close_link}">
+                    <input type="hidden" name="swap_mode" value="list">
+                    <button class="drawer-link" type="submit" title="Close watch dock" aria-label="Close watch dock">Close</button>
+                  </form>
                   {''.join(dock_actions)}
                 </div>
             """
             dock_class = " has-item"
 
+        subtitle_html = (
+            f'<p id="workspace-subtitle" class="workspace-subtitle">'
+            f'profile {html.escape(profile["name"])} · showing {len(items)} of {total}'
+            f"</p>"
+        )
+        pagination_html = f"""
+                <div id="pagination" class="pagination">
+                  <div>{prev_link}</div>
+                  <p>Page {page}</p>
+                  <div class="next">{next_link}</div>
+                </div>
+        """
+        watch_dock_html = f"""
+              <aside id="watch-dock" class="panel watch-dock{dock_class}" data-region="watch-dock">
+                {selected_dock}
+              </aside>
+        """
+
+        if requested_fragment:
+            if requested_fragment == "viewer":
+                row_oob_fragments: list[str] = []
+                row_ids: list[int] = []
+                if selected_open_id > 0:
+                    row_ids.append(selected_open_id)
+                if previous_open_id and previous_open_id not in row_ids:
+                    row_ids.append(previous_open_id)
+                for row_id in row_ids:
+                    row_markup = rows_by_id.get(row_id)
+                    if not row_markup:
+                        continue
+                    row_oob_fragments.append(
+                        row_markup.replace(
+                            f'id="inbox-item-{row_id}"',
+                            f'id="inbox-item-{row_id}" hx-swap-oob="outerHTML"',
+                            1,
+                        )
+                    )
+                self._send_html("\n".join([watch_dock_html, *row_oob_fragments]), headers=response_headers)
+                return
+
+            primary_fragment = message_list_html
+            if requested_fragment == "row" and fragment_item_id is not None and fragment_item_id in rows_by_id:
+                primary_fragment = rows_by_id[fragment_item_id]
+
+            subtitle_oob = subtitle_html.replace(
+                'id="workspace-subtitle"',
+                'id="workspace-subtitle" hx-swap-oob="outerHTML"',
+                1,
+            )
+            pagination_oob = pagination_html.replace(
+                'id="pagination"',
+                'id="pagination" hx-swap-oob="outerHTML"',
+                1,
+            )
+            watch_dock_oob = watch_dock_html.replace(
+                'id="watch-dock"',
+                'id="watch-dock" hx-swap-oob="outerHTML"',
+                1,
+            )
+            self._send_html(
+                "\n".join([primary_fragment, subtitle_oob, pagination_oob, watch_dock_oob]),
+                headers=response_headers,
+            )
+            return
+
         body = _base_layout(
             "mail-tube inbox",
             f"""
-            <div class="workspace">
-              <aside class="panel rail">
+            <div id="inbox-workspace" class="workspace" data-return-to="{safe_return_to}" hx-boost="true" hx-target="this" hx-select="#inbox-workspace" hx-swap="outerHTML show:window:top" hx-push-url="true">
+              <aside class="panel rail" data-region="workspace-rail">
                 <div class="rail-brand">
                   <img src="/resources/MailTube-logo_v0.png" alt="" aria-hidden="true">
                   <span>MailTube</span>
@@ -1078,15 +1508,15 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                 </div>
                 <div class="rail-group">
                   <span class="rail-label">Workspace Tools</span>
-                  <a class="rail-tool-link" href="/filters?{urlencode({'profile': profile_id})}">Edit Filters</a>
-                  <a class="rail-tool-link" href="/profiles?{urlencode({'return_to': profile_switch_return})}">Manage Profiles</a>
+                  <a class="rail-tool-link" hx-boost="false" href="/filters?{urlencode({'profile': profile_id})}">Edit Filters</a>
+                  <a class="rail-tool-link" hx-boost="false" href="/profiles?{urlencode({'return_to': profile_switch_return})}">Manage Profiles</a>
                 </div>
               </aside>
-              <section class="panel workspace-main">
+              <section class="panel workspace-main" data-region="workspace-main">
                 <header class="workspace-head">
                   <div>
                     <h1 class="workspace-title">{html.escape(list_labels.get(active_list, "Inbox"))} Stream</h1>
-                    <p class="workspace-subtitle">profile {html.escape(profile["name"])} · showing {len(items)} of {total}</p>
+                    {subtitle_html}
                   </div>
                   <div class="head-actions">
                     <form method="post" action="/inbox/refresh">
@@ -1094,25 +1524,32 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                       <input type="hidden" name="return_to" value="{return_to}">
                       <button type="submit" title="Refresh now" aria-label="Refresh now">Refresh</button>
                     </form>
+                    <button type="button" class="selection-toggle" data-select-toggle aria-pressed="false">Select Mode</button>
                   </div>
                 </header>
+                <form class="bulk-toolbar" data-bulk-form method="post" action="/inbox/bulk" hx-select="unset" hx-target="#message-list" hx-swap="outerHTML show:none">
+                  <p class="bulk-count" data-bulk-count>0 selected</p>
+                  <input type="hidden" name="item_ids" value="">
+                  <input type="hidden" name="return_to" value="{safe_return_to}">
+                  <input type="hidden" name="swap_mode" value="list">
+                  <div class="bulk-actions">
+                    <button type="submit" name="action" value="star" data-bulk-submit disabled>Star</button>
+                    <button type="submit" name="action" value="unstar" data-bulk-submit disabled>Unstar</button>
+                    <button type="submit" name="action" value="trash" data-bulk-submit disabled>Trash</button>
+                    <button type="submit" name="action" value="watch" data-bulk-submit disabled>Watched</button>
+                    <button type="submit" name="action" value="inbox" data-bulk-submit disabled>Inbox</button>
+                    <button type="button" data-bulk-cancel>Done</button>
+                  </div>
+                </form>
                 {banner}
-                <div class="message-list">
-                  {''.join(rows)}
-                </div>
-                <div class="pagination">
-                  <div>{prev_link}</div>
-                  <p>Page {page}</p>
-                  <div class="next">{next_link}</div>
-                </div>
+                {message_list_html}
+                {pagination_html}
               </section>
-              <aside class="panel watch-dock{dock_class}">
-                {selected_dock}
-              </aside>
+              {watch_dock_html}
             </div>
             """,
         )
-        self._send_html(body)
+        self._send_html(body, headers=response_headers)
 
     def _render_filters(self, query: dict[str, list[str]]) -> None:
         profiles = self.db.list_profiles()
@@ -1192,8 +1629,8 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                     <option value="long">Long (&gt;20m)</option>
                   </select>
                   <select name="since_mode">
+                    <option value="from_now" selected>From now</option>
                     <option value="anytime">Anytime</option>
-                    <option value="from_now">From now</option>
                   </select>
                   <button type="submit">Add</button>
                 </form>
@@ -1318,12 +1755,11 @@ class MailTubeHandler(BaseHTTPRequestHandler):
 
     def _post_refresh(self, form: dict[str, str]) -> None:
         profile_id = _to_int(form.get("profile_id"), default=-1)
-        return_to = form.get("return_to")
         if profile_id > 0:
             refresh_profile(self.db, profile_id, api_key=get_youtube_api_key())
-            self._redirect(return_to or f"/inbox?{urlencode({'profile': profile_id})}")
+            self._respond_inbox_action(form, default=f"/inbox?{urlencode({'profile': profile_id})}")
             return
-        self._redirect("/inbox")
+        self._respond_inbox_action(form, default="/inbox")
 
     def _post_mark_watch(self, path: str, form: dict[str, str], *, watched: bool) -> None:
         parts = [part for part in path.split("/") if part]
@@ -1335,7 +1771,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
             return
         self.db.mark_inbox_watched(inbox_item_id, watched=watched)
-        self._redirect(form.get("return_to") or "/inbox")
+        self._respond_inbox_action(form, default="/inbox", item_id=inbox_item_id)
 
     def _post_mark_trash(self, path: str, form: dict[str, str]) -> None:
         parts = [part for part in path.split("/") if part]
@@ -1347,7 +1783,9 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
             return
         self.db.mark_inbox_trashed(inbox_item_id)
-        self._redirect(form.get("return_to") or "/inbox")
+        next_form = dict(form)
+        next_form["return_to"] = _drop_open_from_return_to_if_matches(form.get("return_to"), inbox_item_id=inbox_item_id) or "/inbox"
+        self._respond_inbox_action(next_form, default="/inbox", item_id=inbox_item_id)
 
     def _post_mark_star(self, path: str, form: dict[str, str], *, starred: bool) -> None:
         parts = [part for part in path.split("/") if part]
@@ -1359,7 +1797,50 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
             return
         self.db.mark_inbox_starred(inbox_item_id, starred=starred)
-        self._redirect(form.get("return_to") or "/inbox")
+        self._respond_inbox_action(form, default="/inbox", item_id=inbox_item_id)
+
+    def _post_close_viewer(self, path: str, form: dict[str, str]) -> None:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) != 4:
+            self.send_error(404, "Not Found")
+            return
+        inbox_item_id = _to_int(parts[2], default=-1)
+        if inbox_item_id <= 0:
+            self.send_error(404, "Not Found")
+            return
+        self.db.mark_inbox_watched(inbox_item_id, watched=True)
+        self._respond_inbox_action(form, default="/inbox", item_id=inbox_item_id)
+
+    def _post_bulk_action(self, form: dict[str, str]) -> None:
+        action = (form.get("action") or "").strip().lower()
+        raw_ids = form.get("item_ids") or ""
+        item_ids: list[int] = []
+        for part in raw_ids.split(","):
+            item_id = _to_int(part.strip(), default=-1)
+            if item_id > 0 and item_id not in item_ids:
+                item_ids.append(item_id)
+
+        if action and item_ids:
+            for item_id in item_ids:
+                if action == "trash":
+                    self.db.mark_inbox_trashed(item_id)
+                elif action == "star":
+                    self.db.mark_inbox_starred(item_id, starred=True)
+                elif action == "unstar":
+                    self.db.mark_inbox_starred(item_id, starred=False)
+                elif action == "watch":
+                    self.db.mark_inbox_watched(item_id, watched=True)
+                elif action == "inbox":
+                    self.db.mark_inbox_watched(item_id, watched=False)
+
+        next_form = dict(form)
+        return_to = form.get("return_to")
+        if action == "trash" and return_to:
+            for item_id in item_ids:
+                return_to = _drop_open_from_return_to_if_matches(return_to, inbox_item_id=item_id)
+            if return_to:
+                next_form["return_to"] = return_to
+        self._respond_inbox_action(next_form, default="/inbox")
 
     def _post_add_filter(self, form: dict[str, str]) -> None:
         profile_id = _to_int(form.get("profile_id"), default=-1)

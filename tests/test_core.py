@@ -121,12 +121,16 @@ class RefreshFlowTest(unittest.TestCase):
             with db.connect() as conn:
                 columns = {row["name"] for row in conn.execute("PRAGMA table_info(inbox_items)")}
                 self.assertIn("is_starred", columns)
+                self.assertIn("starred_at", columns)
+                self.assertIn("dismissed_at", columns)
                 filter_columns = {row["name"] for row in conn.execute("PRAGMA table_info(profile_filters)")}
                 self.assertIn("duration_bucket", filter_columns)
                 self.assertIn("since_mode", filter_columns)
                 self.assertIn("since_published_after", filter_columns)
                 index_names = {row["name"] for row in conn.execute("PRAGMA index_list(inbox_items)")}
                 self.assertIn("idx_inbox_profile_starred", index_names)
+                self.assertIn("idx_inbox_profile_starred_at", index_names)
+                self.assertIn("idx_inbox_profile_dismissed_at", index_names)
 
     def test_refresh_uses_channel_and_optional_keyword(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
@@ -348,6 +352,203 @@ class RefreshFlowTest(unittest.TestCase):
             trash_items = db.list_inbox_items(profile_id, limit=20, offset=0, statuses=("dismissed",))
             self.assertEqual(len(inbox_items_after), 0)
             self.assertEqual(len(trash_items), 1)
+
+    def test_mark_inbox_opened_can_skip_watched_transition(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("viewer")
+            video_db_id = db.upsert_video(
+                VideoInfo(
+                    youtube_video_id="LLLLLLLLLLL",
+                    title="open only",
+                    channel_id="UCopen",
+                    channel_title="Open",
+                    published_at="2026-01-01T00:00:00Z",
+                    thumbnail_url="",
+                    video_url="https://www.youtube.com/watch?v=LLLLLLLLLLL",
+                )
+            )
+            db.insert_inbox_item(profile_id, video_db_id)
+            inbox_item = db.list_inbox_items(profile_id, limit=20, offset=0, statuses=("new",))[0]
+            inbox_item_id = int(inbox_item["inbox_item_id"])
+
+            db.mark_inbox_opened(inbox_item_id, mark_watched=False)
+
+            with db.connect() as conn:
+                row = conn.execute(
+                    "SELECT status, opened_count, watched_at FROM inbox_items WHERE id = ?",
+                    (inbox_item_id,),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["status"], "new")
+            self.assertEqual(int(row["opened_count"]), 1)
+            self.assertIsNone(row["watched_at"])
+
+            db.mark_inbox_watched(inbox_item_id, watched=True)
+            with db.connect() as conn:
+                watched_row = conn.execute(
+                    "SELECT status, opened_count, watched_at FROM inbox_items WHERE id = ?",
+                    (inbox_item_id,),
+                ).fetchone()
+            self.assertIsNotNone(watched_row)
+            self.assertEqual(watched_row["status"], "watched")
+            self.assertEqual(int(watched_row["opened_count"]), 1)
+            self.assertIsNotNone(watched_row["watched_at"])
+
+    def test_watched_list_can_sort_by_watched_timestamp(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("watched-order")
+            older_published = db.upsert_video(
+                VideoInfo(
+                    youtube_video_id="MMMMMMMMMMM",
+                    title="older upload",
+                    channel_id="UCwatch",
+                    channel_title="Watch",
+                    published_at="2026-01-01T00:00:00Z",
+                    thumbnail_url="",
+                    video_url="https://www.youtube.com/watch?v=MMMMMMMMMMM",
+                )
+            )
+            newer_published = db.upsert_video(
+                VideoInfo(
+                    youtube_video_id="NNNNNNNNNNN",
+                    title="newer upload",
+                    channel_id="UCwatch",
+                    channel_title="Watch",
+                    published_at="2026-01-02T00:00:00Z",
+                    thumbnail_url="",
+                    video_url="https://www.youtube.com/watch?v=NNNNNNNNNNN",
+                )
+            )
+            db.insert_inbox_item(profile_id, older_published)
+            db.insert_inbox_item(profile_id, newer_published)
+            initial = db.list_inbox_items(profile_id, limit=20, offset=0, statuses=("new",))
+            by_video_id = {row["youtube_video_id"]: int(row["inbox_item_id"]) for row in initial}
+            older_item = by_video_id["MMMMMMMMMMM"]
+            newer_item = by_video_id["NNNNNNNNNNN"]
+            db.mark_inbox_watched(older_item, watched=True)
+            db.mark_inbox_watched(newer_item, watched=True)
+
+            with db.connect() as conn:
+                conn.execute("UPDATE inbox_items SET watched_at = '2026-01-03T00:00:00Z' WHERE id = ?", (older_item,))
+                conn.execute("UPDATE inbox_items SET watched_at = '2026-01-04T00:00:00Z' WHERE id = ?", (newer_item,))
+                conn.commit()
+
+            watched_items = db.list_inbox_items(
+                profile_id,
+                limit=20,
+                offset=0,
+                statuses=("watched",),
+                sort_by_watched_at=True,
+            )
+            watched_video_ids = [row["youtube_video_id"] for row in watched_items]
+            self.assertEqual(watched_video_ids, ["NNNNNNNNNNN", "MMMMMMMMMMM"])
+
+    def test_starred_list_can_sort_by_starred_timestamp(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("starred-order")
+            older_published = db.upsert_video(
+                VideoInfo(
+                    youtube_video_id="OOOOOOOOOOO",
+                    title="older upload",
+                    channel_id="UCstar",
+                    channel_title="Star",
+                    published_at="2026-01-01T00:00:00Z",
+                    thumbnail_url="",
+                    video_url="https://www.youtube.com/watch?v=OOOOOOOOOOO",
+                )
+            )
+            newer_published = db.upsert_video(
+                VideoInfo(
+                    youtube_video_id="PPPPPPPPPPP",
+                    title="newer upload",
+                    channel_id="UCstar",
+                    channel_title="Star",
+                    published_at="2026-01-02T00:00:00Z",
+                    thumbnail_url="",
+                    video_url="https://www.youtube.com/watch?v=PPPPPPPPPPP",
+                )
+            )
+            db.insert_inbox_item(profile_id, older_published)
+            db.insert_inbox_item(profile_id, newer_published)
+            initial = db.list_inbox_items(profile_id, limit=20, offset=0, statuses=("new",))
+            by_video_id = {row["youtube_video_id"]: int(row["inbox_item_id"]) for row in initial}
+            older_item = by_video_id["OOOOOOOOOOO"]
+            newer_item = by_video_id["PPPPPPPPPPP"]
+            db.mark_inbox_starred(older_item, starred=True)
+            db.mark_inbox_starred(newer_item, starred=True)
+
+            with db.connect() as conn:
+                conn.execute("UPDATE inbox_items SET starred_at = '2026-01-03T00:00:00Z' WHERE id = ?", (older_item,))
+                conn.execute("UPDATE inbox_items SET starred_at = '2026-01-04T00:00:00Z' WHERE id = ?", (newer_item,))
+                conn.commit()
+
+            starred_items = db.list_inbox_items(
+                profile_id,
+                limit=20,
+                offset=0,
+                statuses=("new", "watched"),
+                starred_only=True,
+                sort_mode="starred",
+            )
+            starred_video_ids = [row["youtube_video_id"] for row in starred_items]
+            self.assertEqual(starred_video_ids, ["PPPPPPPPPPP", "OOOOOOOOOOO"])
+
+    def test_trash_list_can_sort_by_dismissed_timestamp(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("trash-order")
+            older_published = db.upsert_video(
+                VideoInfo(
+                    youtube_video_id="QQQQQQQQQQ1",
+                    title="older upload",
+                    channel_id="UCtrash",
+                    channel_title="Trash",
+                    published_at="2026-01-01T00:00:00Z",
+                    thumbnail_url="",
+                    video_url="https://www.youtube.com/watch?v=QQQQQQQQQQ1",
+                )
+            )
+            newer_published = db.upsert_video(
+                VideoInfo(
+                    youtube_video_id="QQQQQQQQQQ2",
+                    title="newer upload",
+                    channel_id="UCtrash",
+                    channel_title="Trash",
+                    published_at="2026-01-02T00:00:00Z",
+                    thumbnail_url="",
+                    video_url="https://www.youtube.com/watch?v=QQQQQQQQQQ2",
+                )
+            )
+            db.insert_inbox_item(profile_id, older_published)
+            db.insert_inbox_item(profile_id, newer_published)
+            initial = db.list_inbox_items(profile_id, limit=20, offset=0, statuses=("new",))
+            by_video_id = {row["youtube_video_id"]: int(row["inbox_item_id"]) for row in initial}
+            older_item = by_video_id["QQQQQQQQQQ1"]
+            newer_item = by_video_id["QQQQQQQQQQ2"]
+            db.mark_inbox_trashed(older_item)
+            db.mark_inbox_trashed(newer_item)
+
+            with db.connect() as conn:
+                conn.execute("UPDATE inbox_items SET dismissed_at = '2026-01-03T00:00:00Z' WHERE id = ?", (older_item,))
+                conn.execute("UPDATE inbox_items SET dismissed_at = '2026-01-04T00:00:00Z' WHERE id = ?", (newer_item,))
+                conn.commit()
+
+            trashed_items = db.list_inbox_items(
+                profile_id,
+                limit=20,
+                offset=0,
+                statuses=("dismissed",),
+                sort_mode="dismissed",
+            )
+            trashed_video_ids = [row["youtube_video_id"] for row in trashed_items]
+            self.assertEqual(trashed_video_ids, ["QQQQQQQQQQ2", "QQQQQQQQQQ1"])
 
     def test_starred_filter_and_trash_clears_star(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
