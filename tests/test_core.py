@@ -5,13 +5,16 @@ import unittest
 from unittest.mock import patch
 
 from mail_tube.db import Database
+from mail_tube.importer import FALLBACK_TITLE_TEMPLATE, import_video_link
 from mail_tube.refresh import refresh_profile
 from mail_tube.youtube import (
     ChannelInfo,
     VideoInfo,
     build_embed_url,
+    duration_matches_filter,
     duration_matches_bucket,
     extract_video_id,
+    fetch_video,
     published_at_on_or_after,
     title_matches_keyword,
 )
@@ -38,6 +41,30 @@ class YouTubeHelpersTest(unittest.TestCase):
         self.assertIn("rel=0", url)
         self.assertIn("iv_load_policy=3", url)
 
+    def test_fetch_video_reads_snippet_metadata(self) -> None:
+        payload = {
+            "items": [
+                {
+                    "id": "dQw4w9WgXcQ",
+                    "snippet": {
+                        "title": "Single import",
+                        "channelId": "UCsingle",
+                        "channelTitle": "Singles",
+                        "publishedAt": "2026-01-05T00:00:00Z",
+                        "thumbnails": {"medium": {"url": "https://example.com/thumb.jpg"}},
+                    },
+                }
+            ]
+        }
+        with patch("mail_tube.youtube._api_get", return_value=payload) as api_get:
+            video = fetch_video("dQw4w9WgXcQ", api_key="fake-key")
+
+        api_get.assert_called_once()
+        self.assertEqual(video.youtube_video_id, "dQw4w9WgXcQ")
+        self.assertEqual(video.title, "Single import")
+        self.assertEqual(video.channel_title, "Singles")
+        self.assertEqual(video.thumbnail_url, "https://example.com/thumb.jpg")
+
     def test_keyword_match_is_case_insensitive_substring(self) -> None:
         self.assertTrue(title_matches_keyword("Great Cat Video", "cat"))
         self.assertTrue(title_matches_keyword("Studio Session", "studio"))
@@ -56,6 +83,15 @@ class YouTubeHelpersTest(unittest.TestCase):
         self.assertTrue(duration_matches_bucket(1201, "long"))
         self.assertTrue(duration_matches_bucket(None, None))
         self.assertFalse(duration_matches_bucket(None, "short"))
+
+    def test_duration_filter_can_exclude_shorts(self) -> None:
+        self.assertFalse(duration_matches_filter(60, None, exclude_shorts=True))
+        self.assertFalse(duration_matches_filter(180, None, exclude_shorts=True))
+        self.assertTrue(duration_matches_filter(181, None, exclude_shorts=True))
+        self.assertTrue(duration_matches_filter(60, None, exclude_shorts=False))
+        self.assertFalse(duration_matches_filter(60, "short", exclude_shorts=True))
+        self.assertTrue(duration_matches_filter(240, "short", exclude_shorts=True))
+        self.assertFalse(duration_matches_filter(360, "short", exclude_shorts=True))
 
     def test_published_at_cutoff_matching(self) -> None:
         self.assertTrue(published_at_on_or_after("2026-01-02T00:00:00Z", None))
@@ -113,6 +149,8 @@ class RefreshFlowTest(unittest.TestCase):
                         opened_count INTEGER NOT NULL DEFAULT 0,
                         UNIQUE(profile_id, video_id)
                     );
+                    INSERT INTO profiles(name, is_active) VALUES ('legacy', 1);
+                    INSERT INTO profile_filters(profile_id, channel_input, keyword) VALUES (1, '@legacy', NULL);
                     """
                 )
                 conn.commit()
@@ -125,8 +163,12 @@ class RefreshFlowTest(unittest.TestCase):
                 self.assertIn("dismissed_at", columns)
                 filter_columns = {row["name"] for row in conn.execute("PRAGMA table_info(profile_filters)")}
                 self.assertIn("duration_bucket", filter_columns)
+                self.assertIn("exclude_shorts", filter_columns)
                 self.assertIn("since_mode", filter_columns)
                 self.assertIn("since_published_after", filter_columns)
+                migrated_filter = conn.execute("SELECT exclude_shorts FROM profile_filters WHERE id = 1").fetchone()
+                self.assertIsNotNone(migrated_filter)
+                self.assertEqual(int(migrated_filter["exclude_shorts"]), 1)
                 index_names = {row["name"] for row in conn.execute("PRAGMA index_list(inbox_items)")}
                 self.assertIn("idx_inbox_profile_starred", index_names)
                 self.assertIn("idx_inbox_profile_starred_at", index_names)
@@ -147,7 +189,14 @@ class RefreshFlowTest(unittest.TestCase):
                     return ChannelInfo(channel_id="UCbbbbbbbbbbbbbbbbbbbbbb", channel_title="BBC")
                 raise AssertionError("Unexpected input")
 
-            def fake_videos(channel_id: str, *, api_key: str, max_results: int = 50) -> list[VideoInfo]:
+            def fake_videos(
+                channel_id: str,
+                *,
+                api_key: str,
+                max_results: int = 50,
+                include_duration: bool = False,
+            ) -> list[VideoInfo]:
+                self.assertTrue(include_duration)
                 if channel_id == "UCaaaaaaaaaaaaaaaaaaaaaa":
                     return [
                         VideoInfo(
@@ -158,6 +207,7 @@ class RefreshFlowTest(unittest.TestCase):
                             published_at="2026-01-01T00:00:00Z",
                             thumbnail_url="",
                             video_url="https://www.youtube.com/watch?v=AAAAAAAAAAA",
+                            duration_seconds=240,
                         ),
                         VideoInfo(
                             youtube_video_id="BBBBBBBBBBB",
@@ -167,6 +217,7 @@ class RefreshFlowTest(unittest.TestCase):
                             published_at="2026-01-02T00:00:00Z",
                             thumbnail_url="",
                             video_url="https://www.youtube.com/watch?v=BBBBBBBBBBB",
+                            duration_seconds=240,
                         ),
                     ]
                 return [
@@ -178,6 +229,7 @@ class RefreshFlowTest(unittest.TestCase):
                         published_at="2026-01-03T00:00:00Z",
                         thumbnail_url="",
                         video_url="https://www.youtube.com/watch?v=CCCCCCCCCCC",
+                        duration_seconds=240,
                     )
                 ]
 
@@ -218,13 +270,23 @@ class RefreshFlowTest(unittest.TestCase):
                 return [
                     VideoInfo(
                         youtube_video_id="HHHHHHHHHHH",
-                        title="short clip",
+                        title="shorts clip",
                         channel_id=channel_id,
                         channel_title="ABC",
                         published_at="2026-01-01T00:00:00Z",
                         thumbnail_url="",
                         video_url="https://www.youtube.com/watch?v=HHHHHHHHHHH",
                         duration_seconds=60,
+                    ),
+                    VideoInfo(
+                        youtube_video_id="SSSSSSSSSSS",
+                        title="short regular clip",
+                        channel_id=channel_id,
+                        channel_title="ABC",
+                        published_at="2026-01-01T12:00:00Z",
+                        thumbnail_url="",
+                        video_url="https://www.youtube.com/watch?v=SSSSSSSSSSS",
+                        duration_seconds=240,
                     ),
                     VideoInfo(
                         youtube_video_id="IIIIIIIIIII",
@@ -249,7 +311,106 @@ class RefreshFlowTest(unittest.TestCase):
             self.assertEqual(outcome.added_count, 1)
             items = db.list_inbox_items(profile_id, limit=20, offset=0)
             self.assertEqual(len(items), 1)
-            self.assertEqual(items[0]["youtube_video_id"], "HHHHHHHHHHH")
+            self.assertEqual(items[0]["youtube_video_id"], "SSSSSSSSSSS")
+
+    def test_refresh_excludes_shorts_by_default(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("default-no-shorts")
+            db.add_filter(profile_id, "@abc", None)
+
+            def fake_resolve(channel_input: str, *, api_key: str) -> ChannelInfo:
+                if channel_input == "@abc":
+                    return ChannelInfo(channel_id="UCaaaaaaaaaaaaaaaaaaaaaa", channel_title="ABC")
+                raise AssertionError("Unexpected input")
+
+            def fake_videos(
+                channel_id: str,
+                *,
+                api_key: str,
+                max_results: int = 50,
+                include_duration: bool = False,
+            ) -> list[VideoInfo]:
+                self.assertTrue(include_duration)
+                return [
+                    VideoInfo(
+                        youtube_video_id="TTTTTTTTTTT",
+                        title="shorts update",
+                        channel_id=channel_id,
+                        channel_title="ABC",
+                        published_at="2026-01-01T00:00:00Z",
+                        thumbnail_url="",
+                        video_url="https://www.youtube.com/watch?v=TTTTTTTTTTT",
+                        duration_seconds=60,
+                    ),
+                    VideoInfo(
+                        youtube_video_id="UUUUUUUUUUU",
+                        title="regular update",
+                        channel_id=channel_id,
+                        channel_title="ABC",
+                        published_at="2026-01-02T00:00:00Z",
+                        thumbnail_url="",
+                        video_url="https://www.youtube.com/watch?v=UUUUUUUUUUU",
+                        duration_seconds=181,
+                    ),
+                ]
+
+            with (
+                patch("mail_tube.refresh.resolve_channel_input", side_effect=fake_resolve),
+                patch("mail_tube.refresh.fetch_channel_videos", side_effect=fake_videos),
+            ):
+                outcome = refresh_profile(db, profile_id, api_key="fake-key")
+
+            self.assertEqual(outcome.status, "ok")
+            self.assertEqual(outcome.matched_count, 1)
+            items = db.list_inbox_items(profile_id, limit=20, offset=0)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["youtube_video_id"], "UUUUUUUUUUU")
+
+    def test_refresh_any_length_includes_shorts(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("any-length")
+            db.add_filter(profile_id, "@abc", None, exclude_shorts=False)
+
+            def fake_resolve(channel_input: str, *, api_key: str) -> ChannelInfo:
+                if channel_input == "@abc":
+                    return ChannelInfo(channel_id="UCaaaaaaaaaaaaaaaaaaaaaa", channel_title="ABC")
+                raise AssertionError("Unexpected input")
+
+            def fake_videos(
+                channel_id: str,
+                *,
+                api_key: str,
+                max_results: int = 50,
+                include_duration: bool = False,
+            ) -> list[VideoInfo]:
+                self.assertFalse(include_duration)
+                return [
+                    VideoInfo(
+                        youtube_video_id="VVVVVVVVVVV",
+                        title="shorts update",
+                        channel_id=channel_id,
+                        channel_title="ABC",
+                        published_at="2026-01-01T00:00:00Z",
+                        thumbnail_url="",
+                        video_url="https://www.youtube.com/watch?v=VVVVVVVVVVV",
+                    )
+                ]
+
+            with (
+                patch("mail_tube.refresh.resolve_channel_input", side_effect=fake_resolve),
+                patch("mail_tube.refresh.fetch_channel_videos", side_effect=fake_videos),
+            ):
+                outcome = refresh_profile(db, profile_id, api_key="fake-key")
+
+            self.assertEqual(outcome.status, "ok")
+            self.assertEqual(outcome.matched_count, 1)
+            items = db.list_inbox_items(profile_id, limit=20, offset=0)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["youtube_video_id"], "VVVVVVVVVVV")
 
     def test_refresh_respects_from_now_cutoff(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
@@ -269,7 +430,14 @@ class RefreshFlowTest(unittest.TestCase):
                     return ChannelInfo(channel_id="UCaaaaaaaaaaaaaaaaaaaaaa", channel_title="ABC")
                 raise AssertionError("Unexpected input")
 
-            def fake_videos(channel_id: str, *, api_key: str, max_results: int = 50) -> list[VideoInfo]:
+            def fake_videos(
+                channel_id: str,
+                *,
+                api_key: str,
+                max_results: int = 50,
+                include_duration: bool = False,
+            ) -> list[VideoInfo]:
+                self.assertTrue(include_duration)
                 return [
                     VideoInfo(
                         youtube_video_id="JJJJJJJJJJJ",
@@ -279,6 +447,7 @@ class RefreshFlowTest(unittest.TestCase):
                         published_at="2026-01-01T00:00:00Z",
                         thumbnail_url="",
                         video_url="https://www.youtube.com/watch?v=JJJJJJJJJJJ",
+                        duration_seconds=240,
                     ),
                     VideoInfo(
                         youtube_video_id="KKKKKKKKKKK",
@@ -288,6 +457,7 @@ class RefreshFlowTest(unittest.TestCase):
                         published_at="2026-01-03T00:00:00Z",
                         thumbnail_url="",
                         video_url="https://www.youtube.com/watch?v=KKKKKKKKKKK",
+                        duration_seconds=240,
                     ),
                 ]
 
@@ -303,6 +473,75 @@ class RefreshFlowTest(unittest.TestCase):
             items = db.list_inbox_items(profile_id, limit=20, offset=0)
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["youtube_video_id"], "KKKKKKKKKKK")
+
+    def test_update_filter_preserves_resolution_when_channel_is_unchanged(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("edit")
+            filter_id = db.add_filter(profile_id, "@old", "cats", "medium", "from_now")
+            db.update_filter_resolution(
+                filter_id,
+                channel_id="UCold",
+                channel_title="Old Channel",
+                is_valid=True,
+                validation_error=None,
+            )
+            original = db.list_filters(profile_id)[0]
+
+            db.update_filter(
+                profile_id,
+                filter_id,
+                "@old",
+                "dogs",
+                duration_bucket=None,
+                since_mode="from_now",
+                exclude_shorts=False,
+            )
+
+            row = db.list_filters(profile_id)[0]
+            self.assertEqual(row["channel_input"], "@old")
+            self.assertEqual(row["channel_id"], "UCold")
+            self.assertEqual(row["channel_title"], "Old Channel")
+            self.assertEqual(row["keyword"], "dogs")
+            self.assertIsNone(row["duration_bucket"])
+            self.assertEqual(int(row["exclude_shorts"]), 0)
+            self.assertEqual(row["since_mode"], "from_now")
+            self.assertEqual(row["since_published_after"], original["since_published_after"])
+
+    def test_update_filter_clears_resolution_when_channel_changes(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("edit-channel")
+            filter_id = db.add_filter(profile_id, "@old", "cats", "medium", "anytime")
+            db.update_filter_resolution(
+                filter_id,
+                channel_id="UCold",
+                channel_title="Old Channel",
+                is_valid=True,
+                validation_error=None,
+            )
+
+            db.update_filter(
+                profile_id,
+                filter_id,
+                "@new",
+                "dogs",
+                duration_bucket=None,
+                since_mode="from_now",
+                exclude_shorts=False,
+            )
+
+            row = db.list_filters(profile_id)[0]
+            self.assertEqual(row["channel_input"], "@new")
+            self.assertIsNone(row["channel_id"])
+            self.assertIsNone(row["channel_title"])
+            self.assertEqual(row["keyword"], "dogs")
+            self.assertIsNone(row["duration_bucket"])
+            self.assertEqual(int(row["exclude_shorts"]), 0)
+            self.assertEqual(row["since_mode"], "from_now")
+            self.assertIsNotNone(row["since_published_after"])
 
     def test_inbox_dedupe_is_per_profile(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
@@ -324,6 +563,95 @@ class RefreshFlowTest(unittest.TestCase):
             self.assertTrue(db.insert_inbox_item(p1, video_db_id))
             self.assertFalse(db.insert_inbox_item(p1, video_db_id))
             self.assertTrue(db.insert_inbox_item(p2, video_db_id))
+
+    def test_import_link_can_use_fallback_metadata_without_api_key(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("manual")
+
+            result = import_video_link(
+                db,
+                profile_id,
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                action="inbox",
+                api_key=None,
+            )
+
+            self.assertTrue(result.inserted)
+            self.assertTrue(result.used_fallback_metadata)
+            items = db.list_inbox_items(profile_id, limit=20, offset=0, statuses=("new",))
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["youtube_video_id"], "dQw4w9WgXcQ")
+            self.assertEqual(items[0]["title"], FALLBACK_TITLE_TEMPLATE.format(video_id="dQw4w9WgXcQ"))
+
+    def test_import_fallback_does_not_overwrite_existing_video_metadata(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("existing")
+            db.upsert_video(
+                VideoInfo(
+                    youtube_video_id="dQw4w9WgXcQ",
+                    title="Known title",
+                    channel_id="UCknown",
+                    channel_title="Known channel",
+                    published_at="2026-01-01T00:00:00Z",
+                    thumbnail_url="https://example.com/known.jpg",
+                    video_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                )
+            )
+
+            import_video_link(db, profile_id, "dQw4w9WgXcQ", action="inbox", api_key=None)
+
+            items = db.list_inbox_items(profile_id, limit=20, offset=0, statuses=("new",))
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["title"], "Known title")
+            self.assertEqual(items[0]["channel_title"], "Known channel")
+
+    def test_import_link_watch_action_saves_watched_history(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("watch")
+
+            result = import_video_link(db, profile_id, "dQw4w9WgXcQ", action="watch", api_key=None)
+
+            watched_items = db.list_inbox_items(profile_id, limit=20, offset=0, statuses=("watched",))
+            inbox_items = db.list_inbox_items(profile_id, limit=20, offset=0, statuses=("new",))
+            self.assertEqual(len(watched_items), 1)
+            self.assertEqual(len(inbox_items), 0)
+            self.assertEqual(int(watched_items[0]["inbox_item_id"]), result.inbox_item_id)
+
+    def test_import_link_starred_action_adds_to_starred_list(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("star-import")
+
+            import_video_link(db, profile_id, "dQw4w9WgXcQ", action="starred", api_key=None)
+
+            starred_items = db.list_inbox_items(
+                profile_id,
+                limit=20,
+                offset=0,
+                statuses=("new", "watched"),
+                starred_only=True,
+            )
+            self.assertEqual(len(starred_items), 1)
+            self.assertEqual(starred_items[0]["youtube_video_id"], "dQw4w9WgXcQ")
+            self.assertEqual(int(starred_items[0]["is_starred"]), 1)
+
+    def test_import_link_rejects_invalid_link_without_db_changes(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = Database(tmp.name)
+            db.init()
+            profile_id = db.create_profile("invalid")
+
+            with self.assertRaises(ValueError):
+                import_video_link(db, profile_id, "https://example.com/watch?v=nope", action="inbox", api_key=None)
+
+            self.assertEqual(db.count_inbox_items(profile_id, statuses=("new", "watched", "dismissed")), 0)
 
     def test_trash_status_moves_item_out_of_inbox(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:

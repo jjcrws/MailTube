@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from .db import Database, VideoRecord
 from .youtube import (
     YouTubeAPIError,
-    duration_matches_bucket,
+    duration_matches_filter,
     fetch_channel_videos,
     published_at_on_or_after,
     resolve_channel_input,
@@ -64,6 +64,7 @@ def refresh_profile(
         channel_input = row["channel_input"]
         keyword = (row["keyword"] or "").strip()
         duration_bucket = (row["duration_bucket"] or "").strip().lower() or None
+        exclude_shorts = bool(row["exclude_shorts"])
         since_mode = (row["since_mode"] or "anytime").strip().lower()
         since_published_after = row["since_published_after"] if since_mode == "from_now" else None
 
@@ -90,7 +91,7 @@ def refresh_profile(
 
         try:
             fetch_kwargs = {"max_results": max_results_per_filter}
-            if duration_bucket:
+            if duration_bucket or exclude_shorts:
                 fetch_kwargs["include_duration"] = True
             videos = fetch_channel_videos(channel.channel_id, api_key=api_key, **fetch_kwargs)
         except YouTubeAPIError as exc:
@@ -101,7 +102,7 @@ def refresh_profile(
         for video in videos:
             if not title_matches_keyword(video.title, keyword):
                 continue
-            if not duration_matches_bucket(video.duration_seconds, duration_bucket):
+            if not duration_matches_filter(video.duration_seconds, duration_bucket, exclude_shorts=exclude_shorts):
                 continue
             if not published_at_on_or_after(video.published_at, since_published_after):
                 continue

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS profile_filters (
     channel_title TEXT,
     keyword TEXT,
     duration_bucket TEXT CHECK(duration_bucket IN ('short', 'medium', 'long') OR duration_bucket IS NULL),
+    exclude_shorts INTEGER NOT NULL DEFAULT 1 CHECK(exclude_shorts IN (0, 1)),
     since_mode TEXT NOT NULL DEFAULT 'anytime' CHECK(since_mode IN ('anytime', 'from_now')),
     since_published_after TEXT,
     is_valid INTEGER NOT NULL DEFAULT 1,
@@ -116,6 +117,13 @@ class Database:
                     duration_bucket IN ('short', 'medium', 'long')
                     OR duration_bucket IS NULL
                 )
+                """
+            )
+        if "exclude_shorts" not in filter_columns:
+            conn.execute(
+                """
+                ALTER TABLE profile_filters
+                ADD COLUMN exclude_shorts INTEGER NOT NULL DEFAULT 1 CHECK(exclude_shorts IN (0, 1))
                 """
             )
         if "since_mode" not in filter_columns:
@@ -268,6 +276,7 @@ class Database:
         keyword: str | None,
         duration_bucket: str | None = None,
         since_mode: str = "anytime",
+        exclude_shorts: bool = True,
     ) -> int:
         clean_channel = channel_input.strip()
         if not clean_channel:
@@ -298,16 +307,18 @@ class Database:
                     channel_input,
                     keyword,
                     duration_bucket,
+                    exclude_shorts,
                     since_mode,
                     since_published_after
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     profile_id,
                     clean_channel,
                     clean_keyword,
                     clean_duration_bucket,
+                    1 if exclude_shorts else 0,
                     clean_since_mode,
                     since_published_after,
                 ),
@@ -320,6 +331,80 @@ class Database:
             conn.execute(
                 "DELETE FROM profile_filters WHERE profile_id = ? AND id = ?",
                 (profile_id, filter_id),
+            )
+            conn.commit()
+
+    def update_filter(
+        self,
+        profile_id: int,
+        filter_id: int,
+        channel_input: str,
+        keyword: str | None,
+        duration_bucket: str | None = None,
+        since_mode: str = "anytime",
+        exclude_shorts: bool = True,
+    ) -> None:
+        clean_channel = channel_input.strip()
+        if not clean_channel:
+            raise ValueError("Channel is required.")
+        clean_keyword = (keyword or "").strip() or None
+        clean_duration_bucket = None
+        if duration_bucket is not None:
+            candidate_bucket = duration_bucket.strip().lower()
+            if candidate_bucket:
+                if candidate_bucket not in {"short", "medium", "long"}:
+                    raise ValueError("Duration bucket must be one of short, medium, long.")
+                clean_duration_bucket = candidate_bucket
+        clean_since_mode = (since_mode or "anytime").strip().lower()
+        if clean_since_mode in {"from-now", "fromnow"}:
+            clean_since_mode = "from_now"
+        if clean_since_mode not in {"anytime", "from_now"}:
+            raise ValueError("Since mode must be either anytime or from_now.")
+        since_published_after = None
+        if clean_since_mode == "from_now":
+            since_published_after = (
+                datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            )
+
+        with self.connect() as conn:
+            current = conn.execute(
+                """
+                SELECT channel_input, since_published_after
+                FROM profile_filters
+                WHERE profile_id = ? AND id = ?
+                """,
+                (profile_id, filter_id),
+            ).fetchone()
+            if not current:
+                return
+            channel_changed = clean_channel != str(current["channel_input"]).strip()
+            if clean_since_mode == "from_now" and not channel_changed and current["since_published_after"]:
+                since_published_after = current["since_published_after"]
+
+            conn.execute(
+                f"""
+                UPDATE profile_filters
+                SET channel_input = ?,
+                    {"channel_id = NULL, channel_title = NULL," if channel_changed else ""}
+                    keyword = ?,
+                    duration_bucket = ?,
+                    exclude_shorts = ?,
+                    since_mode = ?,
+                    since_published_after = ?,
+                    {"is_valid = 1, validation_error = NULL," if channel_changed else ""}
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE profile_id = ? AND id = ?
+                """,
+                (
+                    clean_channel,
+                    clean_keyword,
+                    clean_duration_bucket,
+                    1 if exclude_shorts else 0,
+                    clean_since_mode,
+                    since_published_after,
+                    profile_id,
+                    filter_id,
+                ),
             )
             conn.commit()
 
@@ -434,7 +519,14 @@ class Database:
             conn.commit()
             return int(row["id"])
 
-    def insert_inbox_item(self, profile_id: int, video_id: int) -> bool:
+    def get_video_by_youtube_id(self, youtube_video_id: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM videos WHERE youtube_video_id = ?",
+                (youtube_video_id,),
+            ).fetchone()
+
+    def ensure_inbox_item(self, profile_id: int, video_id: int) -> tuple[int, bool]:
         with self.connect() as conn:
             cursor = conn.execute(
                 """
@@ -453,8 +545,20 @@ class Database:
                     """,
                     (profile_id, video_id),
                 )
+            row = conn.execute(
+                """
+                SELECT id
+                FROM inbox_items
+                WHERE profile_id = ? AND video_id = ?
+                """,
+                (profile_id, video_id),
+            ).fetchone()
             conn.commit()
-            return inserted
+            return int(row["id"]), inserted
+
+    def insert_inbox_item(self, profile_id: int, video_id: int) -> bool:
+        _, inserted = self.ensure_inbox_item(profile_id, video_id)
+        return inserted
 
     def count_inbox_items(
         self,

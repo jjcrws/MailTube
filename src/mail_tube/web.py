@@ -10,6 +10,7 @@ from urllib.parse import ParseResult, parse_qs, urlencode, urlparse
 
 from .config import get_youtube_api_key
 from .db import Database
+from .importer import import_video_link
 from .refresh import refresh_all_profiles, refresh_profile
 from .youtube import build_embed_url
 
@@ -38,6 +39,18 @@ def _safe_return_to(value: str | None, *, default: str = "/inbox") -> str:
 def _append_query_flag(url: str, key: str, value: str) -> str:
     joiner = "&" if "?" in url else "?"
     return f"{url}{joiner}{urlencode({key: value})}"
+
+
+def _without_query_keys(url: str, keys: set[str]) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    for key in keys:
+        query.pop(key, None)
+    encoded = urlencode([(k, v) for k, vals in query.items() for v in vals])
+    rebuilt = parsed.path if not encoded else f"{parsed.path}?{encoded}"
+    if parsed.fragment:
+        rebuilt = f"{rebuilt}#{parsed.fragment}"
+    return rebuilt
 
 
 def _drop_open_from_return_to_if_matches(value: str | None, *, inbox_item_id: int) -> str | None:
@@ -94,6 +107,35 @@ def _safe_display_text(value: str | None) -> str:
     return html.escape(html.unescape(value))
 
 
+def _parse_length_mode(value: str | None) -> tuple[str | None, bool]:
+    mode = (value or "no_shorts").strip().lower().replace("-", "_")
+    if mode == "any":
+        return None, False
+    if mode in {"short", "medium", "long"}:
+        return mode, True
+    return None, True
+
+
+def _filter_length_label(duration_bucket: str | None, exclude_shorts: bool) -> str:
+    if duration_bucket == "short":
+        return "short regular (3-5m)" if exclude_shorts else "short (<5m)"
+    if duration_bucket == "medium":
+        return "medium (5-20m)"
+    if duration_bucket == "long":
+        return "long (>20m)"
+    return "no shorts (>3m)" if exclude_shorts else "any"
+
+
+def _filter_length_mode_value(duration_bucket: str | None, exclude_shorts: bool) -> str:
+    if duration_bucket in {"short", "medium", "long"}:
+        return duration_bucket
+    return "no_shorts" if exclude_shorts else "any"
+
+
+def _selected_attr(value: str, selected: str) -> str:
+    return ' selected' if value == selected else ""
+
+
 EYE_ICON_SVG = (
     '<svg viewBox="0 0 24 24" aria-hidden="true">'
     '<path d="M2 12s3.8-6 10-6 10 6 10 6-3.8 6-10 6-10-6-10-6"></path>'
@@ -108,6 +150,13 @@ TRASH_ICON_SVG = (
     '<path d="M19 6l-1 14H6L5 6"></path>'
     '<path d="M10 11v6"></path>'
     '<path d="M14 11v6"></path>'
+    "</svg>"
+)
+
+PEN_ICON_SVG = (
+    '<svg viewBox="0 0 24 24" aria-hidden="true">'
+    '<path d="M12 20h9"></path>'
+    '<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"></path>'
     "</svg>"
 )
 
@@ -358,6 +407,74 @@ def _base_layout(title: str, body: str) -> str:
       padding: 9px 10px;
       color: #ffc7c7;
     }}
+    .banner.info {{
+      border-color: #315b7c;
+      background: rgba(30, 196, 255, 0.08);
+      color: #bfefff;
+    }}
+    .import-panel {{
+      position: relative;
+    }}
+    .import-trigger {{
+      list-style: none;
+      border: 1px solid #2b3a52;
+      border-radius: 999px;
+      padding: 8px 11px;
+      background: #0d1626;
+      color: var(--text);
+      font-size: 0.8rem;
+      min-height: 34px;
+      cursor: pointer;
+      user-select: none;
+    }}
+    .import-trigger::-webkit-details-marker {{
+      display: none;
+    }}
+    .import-panel[open] .import-trigger {{
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--accent-soft);
+    }}
+    .import-popover {{
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      z-index: 80;
+      width: min(520px, calc(100vw - 40px));
+      border: 1px solid #31506f;
+      border-radius: var(--radius-tight);
+      padding: 10px;
+      background: linear-gradient(180deg, #101827, #0b111d);
+      box-shadow: 0 18px 36px rgba(0, 0, 0, 0.38);
+    }}
+    .import-form {{
+      display: grid;
+      gap: 9px;
+    }}
+    .import-form input[name="youtube_link"] {{
+      width: 100%;
+    }}
+    .import-actions {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }}
+    .workspace.is-import-dragging::after {{
+      content: "Drop YouTube link to import";
+      position: fixed;
+      inset: 14px;
+      z-index: 90;
+      display: grid;
+      place-items: center;
+      border: 1px dashed var(--accent);
+      border-radius: var(--radius);
+      background: rgba(7, 9, 13, 0.78);
+      color: var(--text);
+      font-family: "Saira Semi Condensed", "Arial Narrow", sans-serif;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      pointer-events: none;
+    }}
     .message-list {{
       display: grid;
       gap: 8px;
@@ -607,6 +724,28 @@ def _base_layout(title: str, body: str) -> str:
       text-transform: uppercase;
       letter-spacing: 0.08em;
     }}
+    .filter-actions {{
+      display: flex;
+      justify-content: flex-end;
+      gap: 6px;
+    }}
+    .filter-row-editing {{
+      background: rgba(30, 196, 255, 0.06);
+      box-shadow: inset 2px 0 0 var(--accent);
+    }}
+    .edit-context {{
+      border: 1px solid #315b7c;
+      border-radius: var(--radius-tight);
+      padding: 9px 10px;
+      background: rgba(30, 196, 255, 0.08);
+      color: #bfefff;
+      font-size: 0.8rem;
+      line-height: 1.45;
+      margin-bottom: 10px;
+    }}
+    .edit-context strong {{
+      color: var(--text);
+    }}
     .row {{
       display: flex;
       align-items: center;
@@ -757,6 +896,49 @@ def _base_layout(title: str, body: str) -> str:
         return document.querySelector(workspaceSelector);
       }}
 
+      function isEditableTarget(target) {{
+        if (!(target instanceof Element)) {{
+          return false;
+        }}
+        return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+      }}
+
+      function firstImportCandidate(text) {{
+        const value = (text || "").trim();
+        if (!value) {{
+          return "";
+        }}
+        const urlMatch = value.match(/https?:\/\/(?:www\.)?(?:youtube\.com|youtube-nocookie\.com|youtu\.be)\/[^\s<>"']+/i);
+        if (urlMatch) {{
+          return urlMatch[0].replace(/[),.;]+$/, "");
+        }}
+        return /^[A-Za-z0-9_-]{{11}}$/.test(value) ? value : "";
+      }}
+
+      function transferText(dataTransfer) {{
+        if (!dataTransfer) {{
+          return "";
+        }}
+        return dataTransfer.getData("text/uri-list") || dataTransfer.getData("text/plain") || "";
+      }}
+
+      function openImportPrompt(candidate) {{
+        const workspace = getWorkspace();
+        if (!workspace) {{
+          return false;
+        }}
+        const panel = workspace.querySelector("[data-import-panel]");
+        const input = workspace.querySelector("[data-import-link]");
+        if (!(panel instanceof HTMLDetailsElement) || !(input instanceof HTMLInputElement)) {{
+          return false;
+        }}
+        panel.open = true;
+        input.value = candidate;
+        input.focus();
+        input.select();
+        return true;
+      }}
+
       function resetWindowScrollTop() {{
         window.scrollTo(0, 0);
         document.documentElement.scrollTop = 0;
@@ -890,6 +1072,63 @@ def _base_layout(title: str, body: str) -> str:
         true,
       );
 
+      document.addEventListener("dragover", (event) => {{
+        const workspace = getWorkspace();
+        if (!workspace || !event.dataTransfer) {{
+          return;
+        }}
+        const types = Array.from(event.dataTransfer.types || []);
+        if (!types.includes("text/uri-list") && !types.includes("text/plain")) {{
+          return;
+        }}
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "copy";
+        workspace.classList.add("is-import-dragging");
+      }});
+
+      document.addEventListener("dragleave", (event) => {{
+        const workspace = getWorkspace();
+        if (!workspace) {{
+          return;
+        }}
+        if (event.target === document || event.clientX <= 0 || event.clientY <= 0) {{
+          workspace.classList.remove("is-import-dragging");
+        }}
+      }});
+
+      document.addEventListener("dragend", () => {{
+        const workspace = getWorkspace();
+        if (workspace) {{
+          workspace.classList.remove("is-import-dragging");
+        }}
+      }});
+
+      document.addEventListener("drop", (event) => {{
+        const workspace = getWorkspace();
+        if (!workspace) {{
+          return;
+        }}
+        workspace.classList.remove("is-import-dragging");
+        const candidate = firstImportCandidate(transferText(event.dataTransfer));
+        if (!candidate) {{
+          return;
+        }}
+        event.preventDefault();
+        openImportPrompt(candidate);
+      }});
+
+      document.addEventListener("paste", (event) => {{
+        if (isEditableTarget(event.target)) {{
+          return;
+        }}
+        const candidate = firstImportCandidate(event.clipboardData?.getData("text/plain") || "");
+        if (!candidate) {{
+          return;
+        }}
+        event.preventDefault();
+        openImportPrompt(candidate);
+      }});
+
       document.body.addEventListener("htmx:afterSwap", (event) => {{
         const workspace = getWorkspace();
         if (!workspace) {{
@@ -981,6 +1220,9 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         if path == "/inbox/refresh":
             self._post_refresh(form)
             return
+        if path == "/inbox/import":
+            self._post_import(form)
+            return
         if path.startswith("/inbox/item/") and path.endswith("/watch"):
             self._post_mark_watch(path, form, watched=True)
             return
@@ -1004,6 +1246,9 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             return
         if path == "/filters/add":
             self._post_add_filter(form)
+            return
+        if path == "/filters/update":
+            self._post_update_filter(form)
             return
         if path == "/filters/delete":
             self._post_delete_filter(form)
@@ -1332,10 +1577,20 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         if offset + len(items) < total:
             next_link = f'<a class="drawer-link" href="{_inbox_location(profile_id, active_list, page=page + 1)}">Next</a>'
 
-        banner = ""
+        banners: list[str] = []
         if latest_run and latest_run["status"] != "ok":
             error_text = html.escape(latest_run["error_message"] or "Refresh failed.")
-            banner = f'<div class="banner"><strong>Refresh issue:</strong> {error_text}</div>'
+            banners.append(f'<div class="banner"><strong>Refresh issue:</strong> {error_text}</div>')
+        import_error = (query.get("import_error") or [None])[0]
+        import_notice = (query.get("import_notice") or [None])[0]
+        if import_error:
+            banners.append('<div class="banner"><strong>Import issue:</strong> Enter a YouTube video link or video ID.</div>')
+        elif import_notice == "fallback":
+            banners.append(
+                '<div class="banner info"><strong>Imported with minimal metadata:</strong> '
+                "MailTube used a fallback title because YouTube metadata was unavailable.</div>"
+            )
+        banner = "".join(banners)
 
         selected_dock = """
             <div class="watch-dock-empty">
@@ -1519,6 +1774,21 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                     {subtitle_html}
                   </div>
                   <div class="head-actions">
+                    <details class="import-panel" data-import-panel>
+                      <summary class="import-trigger">Import Link</summary>
+                      <div class="import-popover">
+                        <form class="import-form" method="post" action="/inbox/import">
+                          <input type="hidden" name="profile_id" value="{profile_id}">
+                          <input type="hidden" name="return_to" value="{safe_return_to}">
+                          <input data-import-link type="text" name="youtube_link" placeholder="YouTube link or video ID" required>
+                          <div class="import-actions">
+                            <button type="submit" name="action" value="watch">Watch Now</button>
+                            <button type="submit" name="action" value="inbox">Add to Inbox</button>
+                            <button type="submit" name="action" value="starred">Star</button>
+                          </div>
+                        </form>
+                      </div>
+                    </details>
                     <form method="post" action="/inbox/refresh">
                       <input type="hidden" name="profile_id" value="{profile_id}">
                       <input type="hidden" name="return_to" value="{return_to}">
@@ -1566,20 +1836,23 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         profile_id = int(profile["id"])
         profile_switch_link = f"/profiles?{urlencode({'return_to': '/filters'})}"
         filters = self.db.list_filters(profile_id)
+        edit_filter_id = _to_int((query.get("edit") or [None])[0], default=-1)
+        edit_filter = next((row for row in filters if int(row["id"]) == edit_filter_id), None)
         rows = []
         for row in filters:
             filter_id = int(row["id"])
             channel_input = html.escape(row["channel_input"])
             channel_title = html.escape(row["channel_title"] or "")
             keyword = html.escape(row["keyword"] or "")
-            duration = html.escape(row["duration_bucket"] or "any")
+            duration = html.escape(_filter_length_label(row["duration_bucket"], bool(row["exclude_shorts"])))
             since_mode = row["since_mode"] or "anytime"
             since_label = "from now" if since_mode == "from_now" else "anytime"
             validity = "ok" if row["is_valid"] else "invalid"
+            edit_link = f"/filters?{urlencode({'profile': profile_id, 'edit': filter_id})}"
+            editing_class = ' class="filter-row-editing"' if edit_filter and filter_id == int(edit_filter["id"]) else ""
             rows.append(
                 f"""
-                <tr>
-                  <td>{filter_id}</td>
+                <tr{editing_class}>
                   <td>{channel_input}</td>
                   <td>{channel_title}</td>
                   <td>{keyword}</td>
@@ -1587,20 +1860,48 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                   <td>{html.escape(since_label)}</td>
                   <td>{validity}</td>
                   <td>
-                    <form method="post" action="/filters/delete">
-                      <input type="hidden" name="profile_id" value="{profile_id}">
-                      <input type="hidden" name="filter_id" value="{filter_id}">
-                      <button type="submit">Delete</button>
-                    </form>
+                    <div class="filter-actions">
+                      <a class="icon-link-button" href="{edit_link}" title="Edit filter" aria-label="Edit filter">{PEN_ICON_SVG}</a>
+                      <form method="post" action="/filters/delete">
+                        <input type="hidden" name="profile_id" value="{profile_id}">
+                        <input type="hidden" name="filter_id" value="{filter_id}">
+                        <button class="icon-button" type="submit" title="Delete filter" aria-label="Delete filter">{TRASH_ICON_SVG}</button>
+                      </form>
+                    </div>
                   </td>
                 </tr>
                 """
             )
 
         if not rows:
-            rows.append('<tr><td colspan="8" class="muted">No filters yet.</td></tr>')
+            rows.append('<tr><td colspan="7" class="muted">No filters yet.</td></tr>')
 
         back_link = _inbox_location(profile_id, "inbox")
+        form_title = "Editing Filter" if edit_filter else "Add Filter"
+        form_action = "/filters/update" if edit_filter else "/filters/add"
+        form_channel = html.escape(edit_filter["channel_input"] if edit_filter else "", quote=True)
+        form_keyword = html.escape((edit_filter["keyword"] or "") if edit_filter else "", quote=True)
+        form_length_mode = (
+            _filter_length_mode_value(edit_filter["duration_bucket"], bool(edit_filter["exclude_shorts"]))
+            if edit_filter
+            else "no_shorts"
+        )
+        form_since_mode = (edit_filter["since_mode"] or "anytime") if edit_filter else "from_now"
+        filter_id_input = (
+            f'<input type="hidden" name="filter_id" value="{int(edit_filter["id"])}">' if edit_filter else ""
+        )
+        cancel_edit_link = (
+            f'<a class="drawer-link" href="/filters?{urlencode({"profile": profile_id})}">Cancel</a>' if edit_filter else ""
+        )
+        submit_label = "Save" if edit_filter else "Add"
+        edit_context = ""
+        if edit_filter:
+            editing_channel = _safe_display_text(edit_filter["channel_input"])
+            resolved_channel = _safe_display_text(edit_filter["channel_title"] or edit_filter["channel_id"] or "unresolved")
+            edit_context = (
+                f'<div class="edit-context"><strong>Editing:</strong> {editing_channel}'
+                f' <span class="muted">| resolved: {resolved_channel}</span></div>'
+            )
 
         body = _base_layout(
             "mail-tube filters",
@@ -1608,7 +1909,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             <section class="settings-shell">
               <header class="panel settings-header">
                 <div>
-                  <h1 class="settings-title">Filter Matrix</h1>
+                  <h1 class="settings-title">Channel Filters</h1>
                   <p class="settings-subtitle">Profile: {html.escape(profile["name"])}</p>
                 </div>
                 <div class="row">
@@ -1617,22 +1918,26 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                 </div>
               </header>
               <section class="panel settings-panel">
-                <h2 class="drawer-title">Add Filter</h2>
-                <form method="post" action="/filters/add" class="row">
+                <h2 class="drawer-title">{form_title}</h2>
+                {edit_context}
+                <form method="post" action="{form_action}" class="row">
                   <input type="hidden" name="profile_id" value="{profile_id}">
-                  <input type="text" name="channel_input" placeholder="Channel URL or @handle" required>
-                  <input type="text" name="keyword" placeholder="Optional keyword">
-                  <select name="duration_bucket">
-                    <option value="">Any length</option>
-                    <option value="short">Short (&lt;5m)</option>
-                    <option value="medium">Medium (5-20m)</option>
-                    <option value="long">Long (&gt;20m)</option>
+                  {filter_id_input}
+                  <input type="text" name="channel_input" placeholder="Channel URL or @handle" value="{form_channel}" required>
+                  <input type="text" name="keyword" placeholder="Optional keyword" value="{form_keyword}">
+                  <select name="length_mode">
+                    <option value="no_shorts"{_selected_attr("no_shorts", form_length_mode)}>No Shorts (&gt;3m)</option>
+                    <option value="any"{_selected_attr("any", form_length_mode)}>Any length</option>
+                    <option value="short"{_selected_attr("short", form_length_mode)}>Short regular (3-5m)</option>
+                    <option value="medium"{_selected_attr("medium", form_length_mode)}>Medium (5-20m)</option>
+                    <option value="long"{_selected_attr("long", form_length_mode)}>Long (&gt;20m)</option>
                   </select>
                   <select name="since_mode">
-                    <option value="from_now" selected>From now</option>
-                    <option value="anytime">Anytime</option>
+                    <option value="from_now"{_selected_attr("from_now", form_since_mode)}>From now</option>
+                    <option value="anytime"{_selected_attr("anytime", form_since_mode)}>Anytime</option>
                   </select>
-                  <button type="submit">Add</button>
+                  <button type="submit">{submit_label}</button>
+                  {cancel_edit_link}
                 </form>
               </section>
               <section class="panel settings-panel">
@@ -1640,7 +1945,6 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                 <table>
                   <thead>
                     <tr>
-                      <th>ID</th>
                       <th>Channel Input</th>
                       <th>Resolved Channel</th>
                       <th>Keyword</th>
@@ -1761,6 +2065,46 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             return
         self._respond_inbox_action(form, default="/inbox")
 
+    def _post_import(self, form: dict[str, str]) -> None:
+        profile_id = _to_int(form.get("profile_id"), default=-1)
+        return_to = _without_query_keys(
+            _safe_return_to(form.get("return_to"), default=f"/inbox?{urlencode({'profile': profile_id})}"),
+            {"import_error", "import_notice"},
+        )
+        if profile_id <= 0:
+            self._redirect(_append_query_flag(return_to, "import_error", "1"))
+            return
+
+        try:
+            result = import_video_link(
+                self.db,
+                profile_id,
+                form.get("youtube_link") or "",
+                action=form.get("action") or "",
+                api_key=get_youtube_api_key(),
+            )
+        except ValueError:
+            self._redirect(_append_query_flag(return_to, "import_error", "1"))
+            return
+
+        parsed_return = urlparse(return_to)
+        return_query = parse_qs(parsed_return.query)
+        active_list = (return_query.get("list") or ["inbox"])[0]
+        if active_list not in {"inbox", "watched", "trash", "starred"}:
+            active_list = "inbox"
+        page = max(1, _to_int((return_query.get("page") or [None])[0], default=1))
+
+        if result.action == "inbox":
+            target = _inbox_location(profile_id, "inbox")
+        elif result.action == "starred":
+            target = _inbox_location(profile_id, "starred")
+        else:
+            target = _inbox_location(profile_id, active_list, page=page, open_item_id=result.inbox_item_id)
+
+        if result.used_fallback_metadata:
+            target = _append_query_flag(target, "import_notice", "fallback")
+        self._redirect(target)
+
     def _post_mark_watch(self, path: str, form: dict[str, str], *, watched: bool) -> None:
         parts = [part for part in path.split("/") if part]
         if len(parts) != 4:
@@ -1846,7 +2190,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
         profile_id = _to_int(form.get("profile_id"), default=-1)
         channel_input = (form.get("channel_input") or "").strip()
         keyword = (form.get("keyword") or "").strip() or None
-        duration_bucket = (form.get("duration_bucket") or "").strip().lower() or None
+        duration_bucket, exclude_shorts = _parse_length_mode(form.get("length_mode") or form.get("duration_bucket"))
         since_mode = (form.get("since_mode") or "anytime").strip().lower()
         if profile_id <= 0:
             self._redirect("/filters")
@@ -1859,6 +2203,32 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                     keyword,
                     duration_bucket=duration_bucket,
                     since_mode=since_mode,
+                    exclude_shorts=exclude_shorts,
+                )
+            except ValueError:
+                pass
+        self._redirect(f"/filters?{urlencode({'profile': profile_id})}")
+
+    def _post_update_filter(self, form: dict[str, str]) -> None:
+        profile_id = _to_int(form.get("profile_id"), default=-1)
+        filter_id = _to_int(form.get("filter_id"), default=-1)
+        channel_input = (form.get("channel_input") or "").strip()
+        keyword = (form.get("keyword") or "").strip() or None
+        duration_bucket, exclude_shorts = _parse_length_mode(form.get("length_mode") or form.get("duration_bucket"))
+        since_mode = (form.get("since_mode") or "anytime").strip().lower()
+        if profile_id <= 0:
+            self._redirect("/filters")
+            return
+        if filter_id > 0 and channel_input:
+            try:
+                self.db.update_filter(
+                    profile_id,
+                    filter_id,
+                    channel_input,
+                    keyword,
+                    duration_bucket=duration_bucket,
+                    since_mode=since_mode,
+                    exclude_shorts=exclude_shorts,
                 )
             except ValueError:
                 pass

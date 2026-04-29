@@ -76,6 +76,47 @@ def build_embed_url(video_id: str, *, autoplay: bool = True) -> str:
     return f"https://www.youtube.com/embed/{video_id}?{urlencode(params)}"
 
 
+def _best_thumbnail_url(snippet: dict) -> str:
+    thumbnails = snippet.get("thumbnails", {})
+    return (
+        thumbnails.get("high", {}).get("url")
+        or thumbnails.get("medium", {}).get("url")
+        or thumbnails.get("default", {}).get("url")
+        or ""
+    )
+
+
+def fetch_video(video_id: str, *, api_key: str) -> VideoInfo:
+    clean_video_id = video_id.strip()
+    if not YOUTUBE_ID_RE.fullmatch(clean_video_id):
+        raise YouTubeAPIError("Invalid YouTube video ID.")
+
+    payload = _api_get(
+        "videos",
+        params={
+            "part": "snippet",
+            "id": clean_video_id,
+            "maxResults": "1",
+            "key": api_key,
+        },
+    )
+    items = payload.get("items", [])
+    if not items:
+        raise YouTubeAPIError(f"Unknown YouTube video ID: {clean_video_id}")
+
+    item = items[0]
+    snippet = item.get("snippet", {})
+    return VideoInfo(
+        youtube_video_id=clean_video_id,
+        title=snippet.get("title") or f"Imported YouTube video ({clean_video_id})",
+        channel_id=snippet.get("channelId") or "",
+        channel_title=snippet.get("channelTitle") or "",
+        published_at=snippet.get("publishedAt") or "",
+        thumbnail_url=_best_thumbnail_url(snippet),
+        video_url=f"https://www.youtube.com/watch?v={clean_video_id}",
+    )
+
+
 def title_matches_keyword(title: str, keyword: str | None) -> bool:
     if not keyword:
         return True
@@ -101,6 +142,20 @@ def duration_matches_bucket(duration_seconds: int | None, bucket: str | None) ->
     if clean_bucket == "long":
         return duration_seconds > 20 * 60
     return False
+
+
+def duration_matches_filter(
+    duration_seconds: int | None,
+    bucket: str | None,
+    *,
+    exclude_shorts: bool,
+) -> bool:
+    if exclude_shorts:
+        if duration_seconds is None:
+            return False
+        if duration_seconds <= 3 * 60:
+            return False
+    return duration_matches_bucket(duration_seconds, bucket)
 
 
 def published_at_on_or_after(published_at: str | None, threshold: str | None) -> bool:
@@ -281,13 +336,7 @@ def fetch_channel_videos(
             if not video_id or not YOUTUBE_ID_RE.fullmatch(video_id):
                 continue
 
-            thumbnails = snippet.get("thumbnails", {})
-            thumb = (
-                thumbnails.get("high", {}).get("url")
-                or thumbnails.get("medium", {}).get("url")
-                or thumbnails.get("default", {}).get("url")
-                or ""
-            )
+            thumb = _best_thumbnail_url(snippet)
             title = snippet.get("title") or "(untitled)"
             published_at = snippet.get("publishedAt") or ""
             channel_title = snippet.get("channelTitle") or ""

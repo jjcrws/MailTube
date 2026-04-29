@@ -63,6 +63,25 @@ def create_single_video_html(video_id: str) -> str:
 </html>"""
 
 
+def parse_length_mode(value: str | None) -> tuple[str | None, bool]:
+    mode = (value or "no-shorts").strip().lower().replace("_", "-")
+    if mode == "any":
+        return None, False
+    if mode in {"short", "medium", "long"}:
+        return mode, True
+    return None, True
+
+
+def filter_length_label(duration_bucket: str | None, exclude_shorts: bool) -> str:
+    if duration_bucket == "short":
+        return "short regular (3-5m)" if exclude_shorts else "short (<5m)"
+    if duration_bucket == "medium":
+        return "medium (5-20m)"
+    if duration_bucket == "long":
+        return "long (>20m)"
+    return "no shorts (>3m)" if exclude_shorts else "any"
+
+
 def make_single_video_handler(page: str) -> type[BaseHTTPRequestHandler]:
     class VideoHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -217,8 +236,9 @@ def build_parser() -> argparse.ArgumentParser:
     filter_add.add_argument("--keyword", default="", help="Optional title keyword.")
     filter_add.add_argument(
         "--duration",
-        choices=("short", "medium", "long"),
-        help="Optional length bucket (short <5m, medium 5-20m, long >20m).",
+        choices=("no-shorts", "any", "short", "medium", "long"),
+        default="no-shorts",
+        help="Length mode (default: no-shorts; short means 3-5m).",
     )
     filter_add.add_argument(
         "--since",
@@ -338,12 +358,14 @@ def main() -> None:
     if args.command == "filter":
         if args.filter_command == "add":
             profile = get_profile_or_error(args.profile)
+            duration_bucket, exclude_shorts = parse_length_mode(args.duration)
             filter_id = db.add_filter(
                 int(profile["id"]),
                 args.channel,
                 args.keyword,
-                duration_bucket=args.duration,
+                duration_bucket=duration_bucket,
                 since_mode=args.since,
+                exclude_shorts=exclude_shorts,
             )
             print(f"Added filter row {filter_id} to '{profile['name']}'.")
             return
@@ -357,7 +379,7 @@ def main() -> None:
             print(f"Filters for '{profile['name']}':")
             for row in filters:
                 keyword = row["keyword"] or "-"
-                duration = row["duration_bucket"] or "any"
+                duration = filter_length_label(row["duration_bucket"], bool(row["exclude_shorts"]))
                 since_mode = "from now" if row["since_mode"] == "from_now" else "anytime"
                 resolved = row["channel_title"] or row["channel_id"] or "(unresolved)"
                 valid = "valid" if row["is_valid"] else "invalid"
