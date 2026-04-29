@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .uv-cache/
-mail_tube.db
+.mail_tube.db
 keys/
+.codex
 .mailtube.env

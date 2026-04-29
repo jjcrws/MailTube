@@ -176,8 +176,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mail-tube")
     parser.add_argument(
         "--db",
-        default="mail_tube.db",
-        help="Path to local SQLite database (default: ./mail_tube.db)",
+        default=".mail_tube.db",
+        help="Path to local SQLite database (default: ./.mail_tube.db)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
