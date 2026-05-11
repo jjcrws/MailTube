@@ -979,6 +979,140 @@ def _base_layout(title: str, body: str) -> str:
         }}
       }}
 
+      function htmxIsAvailable() {{
+        return Boolean(window.htmx);
+      }}
+
+      function hxTargetElement(source) {{
+        const targetSpec = source.getAttribute("hx-target");
+        if (!targetSpec) {{
+          return null;
+        }}
+        if (targetSpec === "this") {{
+          return source;
+        }}
+        if (targetSpec.startsWith("closest ")) {{
+          return source.closest(targetSpec.slice("closest ".length).trim());
+        }}
+        return document.querySelector(targetSpec);
+      }}
+
+      function fragmentHtml(fragment) {{
+        return Array.from(fragment.childNodes).map((node) => {{
+          if (node.nodeType === Node.ELEMENT_NODE) {{
+            return node.outerHTML;
+          }}
+          return node.textContent || "";
+        }}).join("");
+      }}
+
+      function selectedHxFragment(source, target, fragment) {{
+        const selectSpec = source.getAttribute("hx-select");
+        if (selectSpec && selectSpec !== "unset") {{
+          const selected = fragment.querySelectorAll(selectSpec);
+          if (selected.length > 0) {{
+            const selectedFragment = document.createDocumentFragment();
+            selected.forEach((node) => selectedFragment.appendChild(node));
+            return selectedFragment;
+          }}
+        }}
+        if (target.id) {{
+          const matchingTarget = fragment.getElementById(target.id);
+          if (matchingTarget) {{
+            const selectedFragment = document.createDocumentFragment();
+            selectedFragment.appendChild(matchingTarget);
+            return selectedFragment;
+          }}
+        }}
+        return fragment;
+      }}
+
+      function applyHxResponse(source, target, htmlText, pushUrl) {{
+        const template = document.createElement("template");
+        template.innerHTML = htmlText;
+
+        template.content.querySelectorAll("[hx-swap-oob]").forEach((incoming) => {{
+          const id = incoming.getAttribute("id");
+          const existing = id ? document.getElementById(id) : null;
+          if (!existing) {{
+            incoming.remove();
+            return;
+          }}
+          incoming.removeAttribute("hx-swap-oob");
+          existing.replaceWith(incoming);
+        }});
+
+        const swap = source.getAttribute("hx-swap") || "innerHTML";
+        const selectedFragment = selectedHxFragment(source, target, template.content);
+        const replacement = fragmentHtml(selectedFragment);
+        let swapTarget = target;
+        if (swap.startsWith("outerHTML")) {{
+          const wrapper = document.createElement("template");
+          wrapper.innerHTML = replacement;
+          const firstElement = wrapper.content.firstElementChild;
+          target.replaceWith(wrapper.content);
+          if (firstElement?.id) {{
+            swapTarget = document.getElementById(firstElement.id) || firstElement;
+          }} else {{
+            swapTarget = firstElement || target;
+          }}
+        }} else {{
+          target.innerHTML = replacement;
+        }}
+
+        if (pushUrl && pushUrl !== "false" && pushUrl !== window.location.pathname + window.location.search) {{
+          history.pushState({{}}, "", pushUrl);
+        }}
+
+        const workspace = getWorkspace();
+        if (workspace) {{
+          updateSelectionUi(workspace);
+        }}
+        swapTarget.dispatchEvent(new CustomEvent("htmx:afterSwap", {{ bubbles: true }}));
+        swapTarget.dispatchEvent(new CustomEvent("htmx:afterSettle", {{ bubbles: true }}));
+        return swapTarget;
+      }}
+
+      async function submitHxForm(form) {{
+        const target = hxTargetElement(form);
+        if (!target) {{
+          return false;
+        }}
+        const response = await fetch(form.action, {{
+          method: (form.method || "post").toUpperCase(),
+          body: new FormData(form),
+          credentials: "same-origin",
+          headers: {{
+            "HX-Request": "true",
+            "HX-Current-URL": window.location.href,
+          }},
+        }});
+        const htmlText = await response.text();
+        const pushUrl = response.headers.get("HX-Push-Url") || form.querySelector('input[name="return_to"]')?.value || "";
+        applyHxResponse(form, target, htmlText, pushUrl);
+        return true;
+      }}
+
+      async function followHxLink(link) {{
+        const target = hxTargetElement(link);
+        const url = link.getAttribute("hx-get");
+        if (!target || !url) {{
+          return false;
+        }}
+        const response = await fetch(url, {{
+          method: "GET",
+          credentials: "same-origin",
+          headers: {{
+            "HX-Request": "true",
+            "HX-Current-URL": window.location.href,
+          }},
+        }});
+        const htmlText = await response.text();
+        const pushUrl = link.getAttribute("hx-push-url") || response.headers.get("HX-Push-Url") || link.href;
+        applyHxResponse(link, target, htmlText, pushUrl);
+        return true;
+      }}
+
       function setSelectMode(workspace, enabled) {{
         workspace.classList.toggle("select-mode", enabled);
         const toggle = workspace.querySelector("[data-select-toggle]");
@@ -1018,6 +1152,24 @@ def _base_layout(title: str, body: str) -> str:
           if (selected.length === 0) {{
             event.preventDefault();
           }}
+        }},
+        true,
+      );
+
+      document.addEventListener(
+        "submit",
+        (event) => {{
+          if (htmxIsAvailable()) {{
+            return;
+          }}
+          const target = event.target;
+          if (!(target instanceof HTMLFormElement) || !target.matches("form[hx-target]")) {{
+            return;
+          }}
+          event.preventDefault();
+          submitHxForm(target).catch(() => {{
+            target.submit();
+          }});
         }},
         true,
       );
@@ -1068,6 +1220,28 @@ def _base_layout(title: str, body: str) -> str:
 
             updateSelectionUi(workspace);
           }}
+        }},
+        true,
+      );
+
+      document.addEventListener(
+        "click",
+        (event) => {{
+          if (htmxIsAvailable()) {{
+            return;
+          }}
+          const target = event.target;
+          if (!(target instanceof Element)) {{
+            return;
+          }}
+          const link = target.closest("a[hx-get][hx-target]");
+          if (!(link instanceof HTMLAnchorElement)) {{
+            return;
+          }}
+          event.preventDefault();
+          followHxLink(link).catch(() => {{
+            window.location.href = link.href;
+          }});
         }},
         true,
       );
@@ -1458,7 +1632,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
 
         rows: list[str] = []
         rows_by_id: dict[int, str] = {}
-        list_swap_attrs = 'hx-select="unset" hx-target="#message-list" hx-swap="outerHTML show:none"'
+        list_swap_attrs = 'hx-select="#message-list" hx-target="#message-list" hx-swap="outerHTML show:none"'
         for item in items:
             inbox_item_id = int(item["inbox_item_id"])
             title = _safe_display_text(item["title"])
@@ -1504,7 +1678,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                 starred_class = " starred" if is_starred else ""
                 star_swap_mode = "row" if active_list in {"inbox", "watched"} else "list"
                 star_swap_attrs = (
-                    'hx-select="unset" hx-target="closest .message-row" hx-swap="outerHTML show:none"'
+                    f'hx-select="#inbox-item-{inbox_item_id}" hx-target="closest .message-row" hx-swap="outerHTML show:none"'
                     if star_swap_mode == "row"
                     else list_swap_attrs
                 )
@@ -1533,7 +1707,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                 f"""
                 <article id="inbox-item-{inbox_item_id}" class="message-row{active_class}">
                   <div class="message-main">
-                    <a href="{open_link}" hx-get="{open_request_link}" hx-push-url="{open_link}" hx-select="unset" hx-target="#watch-dock" hx-swap="outerHTML show:none">{title}</a>
+                    <a href="{open_link}" hx-get="{open_request_link}" hx-push-url="{open_link}" hx-select="#watch-dock" hx-target="#watch-dock" hx-swap="outerHTML show:none">{title}</a>
                     <div class="message-meta">
                       <span>{channel} | {html.escape(published)}</span>
                     </div>
@@ -1797,7 +1971,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                     <button type="button" class="selection-toggle" data-select-toggle aria-pressed="false">Select Mode</button>
                   </div>
                 </header>
-                <form class="bulk-toolbar" data-bulk-form method="post" action="/inbox/bulk" hx-select="unset" hx-target="#message-list" hx-swap="outerHTML show:none">
+                <form class="bulk-toolbar" data-bulk-form method="post" action="/inbox/bulk" hx-select="#message-list" hx-target="#message-list" hx-swap="outerHTML show:none">
                   <p class="bulk-count" data-bulk-count>0 selected</p>
                   <input type="hidden" name="item_ids" value="">
                   <input type="hidden" name="return_to" value="{safe_return_to}">
