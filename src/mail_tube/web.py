@@ -1779,6 +1779,7 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             embed_url = html.escape(build_embed_url(selected_item["youtube_video_id"], autoplay=True), quote=True)
             close_link = _inbox_location(profile_id, active_list, page=page)
             close_action = f"/inbox/item/{selected_open_id}/close"
+            close_swap_attrs = 'hx-select="#inbox-workspace" hx-target="#inbox-workspace" hx-swap="outerHTML show:none"'
             dock_actions: list[str] = []
 
             if selected_status != "new":
@@ -1822,9 +1823,9 @@ class MailTubeHandler(BaseHTTPRequestHandler):
             selected_dock = f"""
                 <div class="watch-dock-head">
                   <h3 class="watch-title">Watch Dock</h3>
-                  <form method="post" action="{close_action}" {list_swap_attrs}>
+                  <form method="post" action="{close_action}" {close_swap_attrs}>
                     <input type="hidden" name="return_to" value="{close_link}">
-                    <input type="hidden" name="swap_mode" value="list">
+                    <input type="hidden" name="swap_mode" value="workspace">
                     <button class="icon-link-button mobile-close" type="submit" title="Close watch dock" aria-label="Close watch dock">{BACK_ICON_SVG}</button>
                   </form>
                 </div>
@@ -1838,9 +1839,9 @@ class MailTubeHandler(BaseHTTPRequestHandler):
                   allowfullscreen
                   title="YouTube video player"></iframe>
                 <div class="watch-actions">
-                  <form method="post" action="{close_action}" {list_swap_attrs}>
+                  <form method="post" action="{close_action}" {close_swap_attrs}>
                     <input type="hidden" name="return_to" value="{close_link}">
-                    <input type="hidden" name="swap_mode" value="list">
+                    <input type="hidden" name="swap_mode" value="workspace">
                     <button class="drawer-link" type="submit" title="Close watch dock" aria-label="Close watch dock">Close</button>
                   </form>
                   {''.join(dock_actions)}
