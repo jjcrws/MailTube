@@ -14,6 +14,7 @@ from mail_tube.youtube import (
     duration_matches_filter,
     duration_matches_bucket,
     extract_video_id,
+    fetch_channel_videos,
     fetch_video,
     published_at_on_or_after,
     title_matches_keyword,
@@ -64,6 +65,134 @@ class YouTubeHelpersTest(unittest.TestCase):
         self.assertEqual(video.title, "Single import")
         self.assertEqual(video.channel_title, "Singles")
         self.assertEqual(video.thumbnail_url, "https://example.com/thumb.jpg")
+
+    def test_fetch_channel_videos_uses_uploads_playlist(self) -> None:
+        channel_payload = {
+            "items": [
+                {
+                    "contentDetails": {
+                        "relatedPlaylists": {"uploads": "UUaaaaaaaaaaaaaaaaaaaaaa"}
+                    }
+                }
+            ]
+        }
+        playlist_payload = {
+            "items": [
+                {
+                    "snippet": {
+                        "title": "Upload one",
+                        "channelTitle": "Playlist owner",
+                        "videoOwnerChannelTitle": "Uploader",
+                        "thumbnails": {"high": {"url": "https://example.com/high.jpg"}},
+                        "publishedAt": "2026-01-01T00:00:00Z",
+                        "resourceId": {"videoId": "AAAAAAAAAAA"},
+                    },
+                    "contentDetails": {
+                        "videoId": "AAAAAAAAAAA",
+                        "videoPublishedAt": "2026-01-02T00:00:00Z",
+                    },
+                }
+            ]
+        }
+
+        with patch("mail_tube.youtube._api_get", side_effect=[channel_payload, playlist_payload]) as api_get:
+            videos = fetch_channel_videos("UCaaaaaaaaaaaaaaaaaaaaaa", api_key="fake-key", max_results=1)
+
+        self.assertEqual(len(videos), 1)
+        self.assertEqual(videos[0].youtube_video_id, "AAAAAAAAAAA")
+        self.assertEqual(videos[0].title, "Upload one")
+        self.assertEqual(videos[0].channel_id, "UCaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(videos[0].channel_title, "Uploader")
+        self.assertEqual(videos[0].published_at, "2026-01-02T00:00:00Z")
+        self.assertEqual(videos[0].thumbnail_url, "https://example.com/high.jpg")
+        self.assertEqual(api_get.call_args_list[0].args[0], "channels")
+        self.assertEqual(api_get.call_args_list[0].kwargs["params"]["part"], "contentDetails")
+        self.assertEqual(api_get.call_args_list[1].args[0], "playlistItems")
+        self.assertEqual(api_get.call_args_list[1].kwargs["params"]["playlistId"], "UUaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(api_get.call_args_list[1].kwargs["params"]["part"], "snippet,contentDetails")
+
+    def test_fetch_channel_videos_paginates_and_fetches_durations(self) -> None:
+        channel_payload = {
+            "items": [
+                {
+                    "contentDetails": {
+                        "relatedPlaylists": {"uploads": "UUaaaaaaaaaaaaaaaaaaaaaa"}
+                    }
+                }
+            ]
+        }
+        first_playlist_payload = {
+            "nextPageToken": "next-page",
+            "items": [
+                {
+                    "snippet": {
+                        "title": "Upload one",
+                        "channelTitle": "Uploader",
+                        "resourceId": {"videoId": "AAAAAAAAAAA"},
+                    },
+                    "contentDetails": {
+                        "videoPublishedAt": "2026-01-01T00:00:00Z",
+                    },
+                }
+            ],
+        }
+        first_duration_payload = {
+            "items": [
+                {
+                    "id": "AAAAAAAAAAA",
+                    "contentDetails": {"duration": "PT4M"},
+                }
+            ]
+        }
+        second_playlist_payload = {
+            "items": [
+                {
+                    "snippet": {
+                        "title": "Upload two",
+                        "channelTitle": "Uploader",
+                        "resourceId": {"videoId": "BBBBBBBBBBB"},
+                    },
+                    "contentDetails": {
+                        "videoId": "BBBBBBBBBBB",
+                        "videoPublishedAt": "2026-01-02T00:00:00Z",
+                    },
+                }
+            ]
+        }
+        second_duration_payload = {
+            "items": [
+                {
+                    "id": "BBBBBBBBBBB",
+                    "contentDetails": {"duration": "PT1H2M3S"},
+                }
+            ]
+        }
+
+        with patch(
+            "mail_tube.youtube._api_get",
+            side_effect=[
+                channel_payload,
+                first_playlist_payload,
+                first_duration_payload,
+                second_playlist_payload,
+                second_duration_payload,
+            ],
+        ) as api_get:
+            videos = fetch_channel_videos(
+                "UCaaaaaaaaaaaaaaaaaaaaaa",
+                api_key="fake-key",
+                max_results=2,
+                include_duration=True,
+            )
+
+        self.assertEqual([video.youtube_video_id for video in videos], ["AAAAAAAAAAA", "BBBBBBBBBBB"])
+        self.assertEqual([video.duration_seconds for video in videos], [240, 3723])
+        self.assertEqual(api_get.call_args_list[1].args[0], "playlistItems")
+        self.assertNotIn("pageToken", api_get.call_args_list[1].kwargs["params"])
+        self.assertEqual(api_get.call_args_list[2].args[0], "videos")
+        self.assertEqual(api_get.call_args_list[3].args[0], "playlistItems")
+        self.assertEqual(api_get.call_args_list[3].kwargs["params"]["pageToken"], "next-page")
+        self.assertEqual(api_get.call_args_list[4].args[0], "videos")
 
     def test_keyword_match_is_case_insensitive_substring(self) -> None:
         self.assertTrue(title_matches_keyword("Great Cat Video", "cat"))

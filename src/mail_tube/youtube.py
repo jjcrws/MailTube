@@ -310,36 +310,60 @@ def fetch_channel_videos(
                 duration_by_id[video_id] = duration_seconds
         return duration_by_id
 
+    def fetch_uploads_playlist_id() -> str:
+        payload = _api_get(
+            "channels",
+            params={
+                "part": "contentDetails",
+                "id": channel_id,
+                "maxResults": "1",
+                "key": api_key,
+            },
+        )
+        items = payload.get("items", [])
+        if not items:
+            raise YouTubeAPIError(f"Unknown channel ID: {channel_id}")
+        uploads_playlist_id = (
+            items[0]
+            .get("contentDetails", {})
+            .get("relatedPlaylists", {})
+            .get("uploads")
+        )
+        if not uploads_playlist_id:
+            raise YouTubeAPIError(f"Channel has no uploads playlist: {channel_id}")
+        return uploads_playlist_id
+
     videos: list[VideoInfo] = []
     page_token: str | None = None
     remaining = max(1, max_results)
+    uploads_playlist_id = fetch_uploads_playlist_id()
 
     while remaining > 0:
         batch_size = min(50, remaining)
         params = {
-            "part": "snippet",
-            "channelId": channel_id,
-            "type": "video",
-            "order": "date",
+            "part": "snippet,contentDetails",
+            "playlistId": uploads_playlist_id,
             "maxResults": str(batch_size),
             "key": api_key,
         }
         if page_token:
             params["pageToken"] = page_token
 
-        payload = _api_get("search", params=params)
+        payload = _api_get("playlistItems", params=params)
         items = payload.get("items", [])
         parsed_items: list[tuple[str, str, str, str, str]] = []
         for item in items:
-            video_id = item.get("id", {}).get("videoId")
             snippet = item.get("snippet", {})
+            content_details = item.get("contentDetails", {})
+            resource_id = snippet.get("resourceId", {})
+            video_id = content_details.get("videoId") or resource_id.get("videoId")
             if not video_id or not YOUTUBE_ID_RE.fullmatch(video_id):
                 continue
 
             thumb = _best_thumbnail_url(snippet)
             title = snippet.get("title") or "(untitled)"
-            published_at = snippet.get("publishedAt") or ""
-            channel_title = snippet.get("channelTitle") or ""
+            published_at = content_details.get("videoPublishedAt") or snippet.get("publishedAt") or ""
+            channel_title = snippet.get("videoOwnerChannelTitle") or snippet.get("channelTitle") or ""
             parsed_items.append((video_id, title, published_at, channel_title, thumb))
 
         duration_by_id: dict[str, int] = {}
